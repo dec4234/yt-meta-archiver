@@ -41,6 +41,12 @@ struct Cli {
 	#[arg(long)]
 	utc: bool,
 
+	/// Work on several posts at once: batches are captured in parallel browser
+	/// sessions and --utc lookups run side by side. Takes the number of
+	/// workers, defaulting to one per core up to 4.
+	#[arg(long, value_name = "WORKERS", num_args = 0..=1, default_missing_value = "0")]
+	mt: Option<usize>,
+
 	/// Log the per-step detail of each capture; repeat (-vv) to include the
 	/// browser's own protocol chatter. RUST_LOG, when set, overrides both.
 	#[arg(short, long, action = clap::ArgAction::Count)]
@@ -58,13 +64,17 @@ fn main() -> Result<()> {
 
 	let url = posts::posts_url(channel);
 	let out_dir = posts::out_dir_for(&url, &base_dir);
+	let workers = cli.mt.map_or(1, worker_count);
 	info!("channel: {url}");
 	info!("output:  {}", out_dir.display());
 	if !cli.utc {
 		info!("dates:   relative only (pass --utc for exact dates)");
 	}
+	if workers > 1 {
+		info!("workers: {workers}");
+	}
 
-	let written = posts::archive(&url, &out_dir, cli.max_posts, cli.utc)?;
+	let written = posts::archive(&url, &out_dir, cli.max_posts, cli.utc, workers)?;
 	info!("wrote {written} screenshots to {}", out_dir.display());
 	info!("index:   {}", out_dir.join(posts::INDEX_FILE).display());
 	Ok(())
@@ -72,6 +82,16 @@ fn main() -> Result<()> {
 
 fn non_empty(value: &str) -> Option<&str> {
 	Some(value.trim()).filter(|v| !v.is_empty())
+}
+
+/// Workers for `--mt`. A bare `--mt` (or `--mt 0`) picks one per core, capped
+/// at 4 — each worker is a whole browser, so more of them starts costing more
+/// in memory and renderer contention than it buys back.
+fn worker_count(requested: usize) -> usize {
+	if requested > 0 {
+		return requested;
+	}
+	std::thread::available_parallelism().map_or(2, |n| n.get()).clamp(2, 4)
 }
 
 /// Sets up logging. Our own output starts at info and gains the per-capture

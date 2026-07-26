@@ -2,7 +2,5 @@
 
 ## TODO
 
-- logs
-- clap
 - parallelize
 - ocr

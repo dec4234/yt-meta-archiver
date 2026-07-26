@@ -2,10 +2,12 @@
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use headless_chrome::Tab;
 use log::{debug, info, trace, warn};
@@ -35,14 +37,25 @@ const BATCH: usize = 30;
 /// Sidecar index written next to the screenshots.
 pub const INDEX_FILE: &str = "posts.json";
 
+/// One screenshot that was written, before its exact date is looked up.
+struct Capture {
+	/// Position in the feed, for log messages.
+	index: usize,
+	file: String,
+	/// The post's YouTube id, absent when the page did not expose one.
+	id: Option<String>,
+	/// The relative time YouTube shows, e.g. "2 years ago".
+	relative: Value,
+}
+
 /// Where a batch stopped, so the next session knows where to resume.
 struct Progress {
 	/// First post the next batch should capture.
 	next: usize,
 	/// The feed had no more posts to load.
 	end_of_feed: bool,
-	/// One entry per screenshot written, keyed by file name.
-	entries: Vec<(String, Value)>,
+	/// One entry per screenshot written, in capture order.
+	captures: Vec<Capture>,
 }
 
 /// Captures every post on the channel, restarting the browser between batches
@@ -50,8 +63,15 @@ struct Progress {
 /// `posts.json` alongside the screenshots and returns how many were written.
 ///
 /// `fetch_dates` turns on the exact-date lookup, which costs one page fetch
-/// per post.
-pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_dates: bool) -> Result<usize> {
+/// per post. `workers` batches are captured side by side, each in its own
+/// browser session; 1 keeps everything on this thread.
+pub fn archive(
+	posts_url: &str,
+	out_dir: &Path,
+	limit: Option<usize>,
+	fetch_dates: bool,
+	workers: usize,
+) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let mut next = 0;
@@ -59,29 +79,151 @@ pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_date
 	let mut index = serde_json::Map::new();
 
 	loop {
-		debug!("starting a browser session at post {}", next + 1);
-		let browser = browser::launch()?;
-		let tab = browser.new_tab()?;
-		tab.set_default_timeout(Duration::from_secs(60));
+		let round = if workers > 1 {
+			run_round(posts_url, out_dir, limit, next, workers)?
+		} else {
+			run_session(posts_url, out_dir, limit, next)?
+		};
 
-		let progress = Archiver::new(&tab, out_dir, limit, fetch_dates).run_batch(posts_url, next)?;
-		index.extend(progress.entries);
-		// Rewritten after every batch, so an interrupted run still leaves a
+		index.extend(resolve_dates(&round.captures, fetch_dates, workers));
+		// Rewritten after every round, so an interrupted run still leaves a
 		// usable index for the screenshots on disk.
 		write_index(out_dir, posts_url, &index)?;
 
-		if progress.end_of_feed || limit.is_some_and(|l| progress.next >= l) {
+		if round.end_of_feed || limit.is_some_and(|l| round.next >= l) {
 			return Ok(index.len());
 		}
-		if progress.next == next {
+		if round.next == next {
 			// The session died without capturing anything; skip the post it
 			// choked on rather than restarting on it forever.
 			warn!("no progress on post {}, skipping it", next + 1);
 			next += 1;
 		} else {
-			next = progress.next;
+			next = round.next;
 		}
 	}
+}
+
+/// One browser session, capturing the batch that starts at `start`.
+fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize) -> Result<Progress> {
+	debug!("starting a browser session at post {}", start + 1);
+	let browser = browser::launch()?;
+	let tab = browser.new_tab()?;
+	tab.set_default_timeout(Duration::from_secs(60));
+	Archiver::new(&tab, out_dir, limit).run_batch(posts_url, start)
+}
+
+/// Runs up to `workers` browser sessions at once, on consecutive batches
+/// starting at `start`, and folds them back into a single [`Progress`].
+///
+/// Every session loads the feed from the top, so a later batch pays for
+/// scrolling past the earlier ones; the capture work, which dominates, is what
+/// actually runs in parallel.
+fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, workers: usize) -> Result<Progress> {
+	let starts: Vec<usize> = (0..workers)
+		.map(|w| start + w * BATCH)
+		.take_while(|s| limit.is_none_or(|l| *s < l))
+		.collect();
+	if starts.len() < 2 {
+		return run_session(posts_url, out_dir, limit, start);
+	}
+	info!("capturing posts {}+ across {} browser sessions", start + 1, starts.len());
+
+	let results: Vec<Result<Progress>> = std::thread::scope(|scope| {
+		let handles: Vec<_> = starts
+			.iter()
+			.map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s)))
+			.collect();
+		handles
+			.into_iter()
+			.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked"))))
+			.collect()
+	});
+
+	// Screenshots from every session are kept — they are on disk either way —
+	// but the resume point may only advance across an unbroken run of them, so
+	// a session that died mid-batch is picked up again next round.
+	let mut round = Progress {
+		next: start,
+		end_of_feed: false,
+		captures: Vec::new(),
+	};
+	let mut broken = false;
+	for (&s, result) in starts.iter().zip(results) {
+		let wanted = limit.map_or(s + BATCH, |l| (s + BATCH).min(l));
+		match result {
+			Ok(session) => {
+				round.captures.extend(session.captures);
+				if broken {
+					continue;
+				}
+				round.next = session.next;
+				round.end_of_feed = session.end_of_feed;
+				if session.end_of_feed {
+					broken = true; // nothing beyond this session to advance past
+				} else if session.next < wanted {
+					warn!("session at post {} stopped at {}", s + 1, session.next + 1);
+					broken = true;
+				}
+			}
+			Err(e) => {
+				// `next` is still the previous session's stopping point, which
+				// for contiguous batches is exactly this one's start.
+				warn!("session at post {} failed: {e:#}", s + 1);
+				broken = true;
+			}
+		}
+	}
+	Ok(round)
+}
+
+/// Turns captures into index entries, looking up each post's exact publication
+/// date when `fetch_dates` is set. The lookups are independent page fetches, so
+/// `workers` of them run at a time.
+fn resolve_dates(captures: &[Capture], fetch_dates: bool, workers: usize) -> Vec<(String, Value)> {
+	let dates: Vec<Option<Value>> = if !fetch_dates {
+		vec![None; captures.len()]
+	} else if workers <= 1 || captures.len() < 2 {
+		captures.iter().map(fetch_date).collect()
+	} else {
+		// A shared cursor rather than fixed slices, so one slow post does not
+		// leave the other threads idle at the end.
+		let cursor = AtomicUsize::new(0);
+		let dates = Mutex::new(vec![None; captures.len()]);
+		std::thread::scope(|scope| {
+			for _ in 0..workers.min(captures.len()) {
+				scope.spawn(|| {
+					loop {
+						let i = cursor.fetch_add(1, Ordering::Relaxed);
+						let Some(capture) = captures.get(i) else { break };
+						if let Some(date) = fetch_date(capture) {
+							dates.lock().expect("date lock poisoned")[i] = Some(date);
+						}
+					}
+				});
+			}
+		});
+		dates.into_inner().expect("date lock poisoned")
+	};
+
+	captures
+		.iter()
+		.zip(dates)
+		.map(|(c, date)| (c.file.clone(), index_entry(c.id.as_deref(), &c.relative, date)))
+		.collect()
+}
+
+/// Best effort: a missing date should not cost us the screenshot. `None` when
+/// the post carried no id to look up, null when the lookup itself failed.
+fn fetch_date(capture: &Capture) -> Option<Value> {
+	let id = capture.id.as_deref()?;
+	Some(match published::fetch_utc(id) {
+		Ok(date) => Value::String(date),
+		Err(e) => {
+			warn!("no exact date for post {}: {e:#}", capture.index + 1);
+			Value::Null
+		}
+	})
 }
 
 fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, Value>) -> Result<()> {
@@ -100,19 +242,16 @@ pub struct Archiver<'a> {
 	out_dir: PathBuf,
 	/// Stop after this many posts; used to sample a channel quickly.
 	limit: Option<usize>,
-	/// Look up each post's exact publication date.
-	fetch_dates: bool,
 	/// Current layout viewport height, to avoid redundant reflows.
 	viewport_height: Cell<u32>,
 }
 
 impl<'a> Archiver<'a> {
-	fn new(tab: &'a Tab, out_dir: impl Into<PathBuf>, limit: Option<usize>, fetch_dates: bool) -> Self {
+	fn new(tab: &'a Tab, out_dir: impl Into<PathBuf>, limit: Option<usize>) -> Self {
 		Self {
 			tab,
 			out_dir: out_dir.into(),
 			limit,
-			fetch_dates,
 			viewport_height: Cell::new(0),
 		}
 	}
@@ -146,20 +285,20 @@ impl<'a> Archiver<'a> {
 			return Ok(Progress {
 				next: start,
 				end_of_feed: true,
-				entries: Vec::new(),
+				captures: Vec::new(),
 			});
 		}
 
 		let mut progress = Progress {
 			next: end,
 			end_of_feed,
-			entries: Vec::new(),
+			captures: Vec::new(),
 		};
 		for i in start..end {
 			match self.capture_post(i) {
-				Ok((file, entry)) => {
-					info!("[{}] {file}", i + 1);
-					progress.entries.push((file, entry));
+				Ok(capture) => {
+					info!("[{}] {}", i + 1, capture.file);
+					progress.captures.push(capture);
 				}
 				Err(e) => {
 					// A dead connection means the browser is gone: hand back to
@@ -349,8 +488,9 @@ impl<'a> Archiver<'a> {
 	/// The post is captured entirely within the viewport — the viewport is
 	/// grown to fit a tall post rather than relying on `captureBeyondViewport`,
 	/// which reflows YouTube's lazily rendered feed and misaligns the clip.
-	/// Returns the screenshot's file name and its index entry.
-	fn capture_post(&self, i: usize) -> Result<(String, Value)> {
+	/// Returns the screenshot's file name and the metadata its index entry
+	/// needs; the exact-date lookup happens later, off the browser session.
+	fn capture_post(&self, i: usize) -> Result<Capture> {
 		let info = self.focus_until_loaded(i)?;
 
 		let height = info["rect"]["height"].as_f64().unwrap_or(0.0);
@@ -408,15 +548,12 @@ impl<'a> Archiver<'a> {
 		let path = self.out_dir.join(&file);
 		std::fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
 
-		// Best effort: a missing date should not cost us the screenshot.
-		let posted_utc = id.filter(|_| self.fetch_dates).map(|id| match published::fetch_utc(id) {
-			Ok(date) => Value::String(date),
-			Err(e) => {
-				warn!("no exact date for post {}: {e:#}", i + 1);
-				Value::Null
-			}
-		});
-		Ok((file, index_entry(id, &meta["published"], posted_utc)))
+		Ok(Capture {
+			index: i,
+			file,
+			id: id.map(str::to_string),
+			relative: meta["published"].clone(),
+		})
 	}
 }
 
