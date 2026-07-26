@@ -10,10 +10,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use headless_chrome::Tab;
-use log::{debug, info, trace, warn};
 use headless_chrome::protocol::cdp::{Emulation, Page, Runtime};
+use log::{debug, info, trace, warn};
 use serde_json::Value;
 
+use crate::published::Details;
 use crate::{browser, published};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
@@ -62,16 +63,11 @@ struct Progress {
 /// (and after a crash) so a long feed does not outlive the renderer. Writes
 /// `posts.json` alongside the screenshots and returns how many were written.
 ///
-/// `fetch_dates` turns on the exact-date lookup, which costs one page fetch
-/// per post. `workers` batches are captured side by side, each in its own
-/// browser session; 1 keeps everything on this thread.
-pub fn archive(
-	posts_url: &str,
-	out_dir: &Path,
-	limit: Option<usize>,
-	fetch_dates: bool,
-	workers: usize,
-) -> Result<usize> {
+/// `fetch_details` turns on the per-post lookup of the exact date and post
+/// text, which costs one page fetch per post. `workers` batches are captured
+/// side by side, each in its own browser session; 1 keeps everything on this
+/// thread.
+pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let mut next = 0;
@@ -85,7 +81,7 @@ pub fn archive(
 			run_session(posts_url, out_dir, limit, next)?
 		};
 
-		index.extend(resolve_dates(&round.captures, fetch_dates, workers));
+		index.extend(resolve_details(&round.captures, fetch_details, workers));
 		// Rewritten after every round, so an interrupted run still leaves a
 		// usable index for the screenshots on disk.
 		write_index(out_dir, posts_url, &index)?;
@@ -120,24 +116,15 @@ fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usi
 /// scrolling past the earlier ones; the capture work, which dominates, is what
 /// actually runs in parallel.
 fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, workers: usize) -> Result<Progress> {
-	let starts: Vec<usize> = (0..workers)
-		.map(|w| start + w * BATCH)
-		.take_while(|s| limit.is_none_or(|l| *s < l))
-		.collect();
+	let starts: Vec<usize> = (0..workers).map(|w| start + w * BATCH).take_while(|s| limit.is_none_or(|l| *s < l)).collect();
 	if starts.len() < 2 {
 		return run_session(posts_url, out_dir, limit, start);
 	}
 	info!("capturing posts {}+ across {} browser sessions", start + 1, starts.len());
 
 	let results: Vec<Result<Progress>> = std::thread::scope(|scope| {
-		let handles: Vec<_> = starts
-			.iter()
-			.map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s)))
-			.collect();
-		handles
-			.into_iter()
-			.map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked"))))
-			.collect()
+		let handles: Vec<_> = starts.iter().map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s))).collect();
+		handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked")))).collect()
 	});
 
 	// Screenshots from every session are kept — they are on disk either way —
@@ -178,52 +165,49 @@ fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize
 }
 
 /// Turns captures into index entries, looking up each post's exact publication
-/// date when `fetch_dates` is set. The lookups are independent page fetches, so
-/// `workers` of them run at a time.
-fn resolve_dates(captures: &[Capture], fetch_dates: bool, workers: usize) -> Vec<(String, Value)> {
-	let dates: Vec<Option<Value>> = if !fetch_dates {
+/// date and text when `fetch_details` is set. The lookups are independent page
+/// fetches, so `workers` of them run at a time.
+fn resolve_details(captures: &[Capture], fetch_details: bool, workers: usize) -> Vec<(String, Value)> {
+	let details: Vec<Option<Details>> = if !fetch_details {
 		vec![None; captures.len()]
 	} else if workers <= 1 || captures.len() < 2 {
-		captures.iter().map(fetch_date).collect()
+		captures.iter().map(fetch_details_for).collect()
 	} else {
 		// A shared cursor rather than fixed slices, so one slow post does not
 		// leave the other threads idle at the end.
 		let cursor = AtomicUsize::new(0);
-		let dates = Mutex::new(vec![None; captures.len()]);
+		let details = Mutex::new(vec![None; captures.len()]);
 		std::thread::scope(|scope| {
 			for _ in 0..workers.min(captures.len()) {
 				scope.spawn(|| {
 					loop {
 						let i = cursor.fetch_add(1, Ordering::Relaxed);
 						let Some(capture) = captures.get(i) else { break };
-						if let Some(date) = fetch_date(capture) {
-							dates.lock().expect("date lock poisoned")[i] = Some(date);
-						}
+						let found = fetch_details_for(capture);
+						details.lock().expect("details lock poisoned")[i] = found;
 					}
 				});
 			}
 		});
-		dates.into_inner().expect("date lock poisoned")
+		details.into_inner().expect("details lock poisoned")
 	};
 
 	captures
 		.iter()
-		.zip(dates)
-		.map(|(c, date)| (c.file.clone(), index_entry(c.id.as_deref(), &c.relative, date)))
+		.zip(details)
+		.map(|(c, details)| (c.file.clone(), index_entry(c.id.as_deref(), &c.relative, details)))
 		.collect()
 }
 
-/// Best effort: a missing date should not cost us the screenshot. `None` when
-/// the post carried no id to look up, null when the lookup itself failed.
-fn fetch_date(capture: &Capture) -> Option<Value> {
+/// Best effort: a failed lookup should not cost us the screenshot. `None` only
+/// when the post carried no id to look up; a lookup that failed comes back
+/// empty, so the index records that it was tried and found nothing.
+fn fetch_details_for(capture: &Capture) -> Option<Details> {
 	let id = capture.id.as_deref()?;
-	Some(match published::fetch_utc(id) {
-		Ok(date) => Value::String(date),
-		Err(e) => {
-			warn!("no exact date for post {}: {e:#}", capture.index + 1);
-			Value::Null
-		}
-	})
+	Some(published::fetch(id).unwrap_or_else(|e| {
+		warn!("no details for post {}: {e:#}", capture.index + 1);
+		Details::default()
+	}))
 }
 
 fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, Value>) -> Result<()> {
@@ -557,17 +541,19 @@ impl<'a> Archiver<'a> {
 	}
 }
 
-/// The `posts.json` value for one screenshot: where the post lives, when it
-/// went up, and the relative time YouTube shows in the screenshot itself.
+/// The `posts.json` value for one screenshot: where the post lives, its text,
+/// when it went up, and the relative time YouTube shows in the screenshot
+/// itself.
 ///
-/// `posted_utc` is absent entirely when exact dates were not requested, and
-/// null when the lookup was attempted but failed — the two are worth telling
-/// apart when reading an index back.
-fn index_entry(id: Option<&str>, relative: &Value, posted_utc: Option<Value>) -> Value {
+/// `posted_utc` and `text` are absent entirely when the lookup was not
+/// requested, and null when it was made but came back without them — the two
+/// are worth telling apart when reading an index back.
+fn index_entry(id: Option<&str>, relative: &Value, details: Option<Details>) -> Value {
 	let mut entry = serde_json::Map::new();
 	entry.insert("url".to_string(), id.map(|id| format!("https://www.youtube.com/post/{id}")).into());
-	if let Some(posted_utc) = posted_utc {
-		entry.insert("posted_utc".to_string(), posted_utc);
+	if let Some(details) = details {
+		entry.insert("posted_utc".to_string(), details.published_utc.into());
+		entry.insert("text".to_string(), details.text.into());
 	}
 	entry.insert("posted_relative".to_string(), relative.clone());
 	Value::Object(entry)

@@ -35,14 +35,14 @@ struct Cli {
 	/// Stop after this many posts
 	max_posts: Option<usize>,
 
-	/// Look up each post's exact publication date. This costs one page fetch
-	/// per post, so it is off by default; without it the index records only
-	/// the relative time YouTube shows.
-	#[arg(long)]
-	utc: bool,
+	/// Look up each post's exact publication date and text, from the post's own
+	/// page. This costs one page fetch per post, so it is off by default;
+	/// without it the index records only the relative time YouTube shows.
+	#[arg(long, visible_alias = "utc")]
+	details: bool,
 
 	/// Work on several posts at once: batches are captured in parallel browser
-	/// sessions and --utc lookups run side by side. Takes the number of
+	/// sessions and --details lookups run side by side. Takes the number of
 	/// workers, defaulting to one per core up to 4.
 	#[arg(long, value_name = "WORKERS", num_args = 0..=1, default_missing_value = "0")]
 	mt: Option<usize>,
@@ -67,14 +67,14 @@ fn main() -> Result<()> {
 	let workers = cli.mt.map_or(1, worker_count);
 	info!("channel: {url}");
 	info!("output:  {}", out_dir.display());
-	if !cli.utc {
-		info!("dates:   relative only (pass --utc for exact dates)");
+	if !cli.details {
+		info!("details: relative dates only (pass --details for exact dates and post text)");
 	}
 	if workers > 1 {
 		info!("workers: {workers}");
 	}
 
-	let written = posts::archive(&url, &out_dir, cli.max_posts, cli.utc, workers)?;
+	let written = posts::archive(&url, &out_dir, cli.max_posts, cli.details, workers)?;
 	info!("wrote {written} screenshots to {}", out_dir.display());
 	info!("index:   {}", out_dir.join(posts::INDEX_FILE).display());
 	Ok(())
