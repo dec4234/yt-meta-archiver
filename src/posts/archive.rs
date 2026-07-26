@@ -11,13 +11,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use base64::Engine;
 use headless_chrome::Tab;
 use headless_chrome::protocol::cdp::Page;
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
 use super::details::{self, Details};
+use crate::browser::ImageFormat;
 use crate::{browser, time};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
@@ -69,8 +69,8 @@ struct Progress {
 /// `fetch_details` turns on the per-post lookup of the exact date and post
 /// text, which costs one page fetch per post. `workers` batches are captured
 /// side by side, each in its own browser session; 1 keeps everything on this
-/// thread.
-pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize) -> Result<usize> {
+/// thread. `format` is what the screenshots are encoded as.
+pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize, format: ImageFormat) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let mut next = 0;
@@ -79,9 +79,9 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fet
 
 	loop {
 		let round = if workers > 1 {
-			run_round(posts_url, out_dir, limit, next, workers)?
+			run_round(posts_url, out_dir, limit, next, workers, format)?
 		} else {
-			run_session(posts_url, out_dir, limit, next)?
+			run_session(posts_url, out_dir, limit, next, format)?
 		};
 
 		index.extend(resolve_details(&round.captures, fetch_details, workers));
@@ -104,12 +104,12 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fet
 }
 
 /// One browser session, capturing the batch that starts at `start`.
-fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize) -> Result<Progress> {
+fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, format: ImageFormat) -> Result<Progress> {
 	debug!("starting a browser session at post {}", start + 1);
 	let browser = browser::launch()?;
 	let tab = browser.new_tab()?;
 	tab.set_default_timeout(Duration::from_secs(60));
-	Archiver::new(&tab, out_dir, limit).run_batch(posts_url, start)
+	Archiver::new(&tab, out_dir, limit, format).run_batch(posts_url, start)
 }
 
 /// Runs up to `workers` browser sessions at once, on consecutive batches
@@ -118,15 +118,15 @@ fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usi
 /// Every session loads the feed from the top, so a later batch pays for
 /// scrolling past the earlier ones; the capture work, which dominates, is what
 /// actually runs in parallel.
-fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, workers: usize) -> Result<Progress> {
+fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, workers: usize, format: ImageFormat) -> Result<Progress> {
 	let starts: Vec<usize> = (0..workers).map(|w| start + w * BATCH).take_while(|s| limit.is_none_or(|l| *s < l)).collect();
 	if starts.len() < 2 {
-		return run_session(posts_url, out_dir, limit, start);
+		return run_session(posts_url, out_dir, limit, start, format);
 	}
 	info!("capturing posts {}+ across {} browser sessions", start + 1, starts.len());
 
 	let results: Vec<Result<Progress>> = std::thread::scope(|scope| {
-		let handles: Vec<_> = starts.iter().map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s))).collect();
+		let handles: Vec<_> = starts.iter().map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s, format))).collect();
 		handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked")))).collect()
 	});
 
@@ -229,16 +229,19 @@ struct Archiver<'a> {
 	out_dir: PathBuf,
 	/// Stop after this many posts; used to sample a channel quickly.
 	limit: Option<usize>,
+	/// What the screenshots are encoded as.
+	format: ImageFormat,
 	/// Current layout viewport height, to avoid redundant reflows.
 	viewport_height: Cell<u32>,
 }
 
 impl<'a> Archiver<'a> {
-	fn new(tab: &'a Tab, out_dir: impl Into<PathBuf>, limit: Option<usize>) -> Self {
+	fn new(tab: &'a Tab, out_dir: impl Into<PathBuf>, limit: Option<usize>, format: ImageFormat) -> Self {
 		Self {
 			tab,
 			out_dir: out_dir.into(),
 			limit,
+			format,
 			viewport_height: Cell::new(0),
 		}
 	}
@@ -452,31 +455,20 @@ impl<'a> Archiver<'a> {
 			scale: 2.0, // capture at 2x for legible text
 		};
 
-		let data = self
-			.tab
-			.call_method(Page::CaptureScreenshot {
-				format: Some(Page::CaptureScreenshotFormatOption::Png),
-				clip: Some(clip),
-				quality: None,
-				from_surface: Some(true),
-				capture_beyond_viewport: Some(false),
-				optimize_for_speed: None,
-			})?
-			.data;
-		let png = base64::prelude::BASE64_STANDARD.decode(data).context("decoding screenshot")?;
+		let image = browser::capture(self.tab, clip, self.format)?;
 		debug!(
 			"post {} captured, {:.0}x{:.0}px, {} KiB",
 			i + 1,
 			rect["width"].as_f64().unwrap_or(0.0),
 			rect["height"].as_f64().unwrap_or(0.0),
-			png.len() / 1024
+			image.len() / 1024
 		);
 
 		let meta = &info["meta"];
 		let id = meta["id"].as_str();
-		let file = file_name(i, id);
+		let file = file_name(i, id, self.format);
 		let path = self.out_dir.join(&file);
-		std::fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
+		std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
 
 		Ok(Capture {
 			index: i,
@@ -506,10 +498,10 @@ fn index_entry(id: Option<&str>, relative: &Value, details: Option<Details>) -> 
 }
 
 /// `0001_UgkxAbC.png`, keeping the channel's newest-first ordering sortable.
-fn file_name(i: usize, id: Option<&str>) -> String {
+fn file_name(i: usize, id: Option<&str>, format: ImageFormat) -> String {
 	let id = id
 		.map(|s| s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect::<String>())
 		.filter(|s| !s.is_empty())
 		.unwrap_or_else(|| "unknown".to_string());
-	format!("{:04}_{}.png", i + 1, id)
+	format!("{:04}_{}.{}", i + 1, id, format.extension())
 }

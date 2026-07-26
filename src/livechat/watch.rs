@@ -14,13 +14,13 @@ use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use headless_chrome::Tab;
 use headless_chrome::protocol::cdp::Page;
 use log::{Level, debug, info, log_enabled, trace, warn};
 use serde_json::Value;
 
 use super::source::Stream;
+use crate::browser::ImageFormat;
 use crate::{browser, time};
 
 const LIVECHAT_JS: &str = include_str!("js/livechat.js");
@@ -58,7 +58,7 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 /// Watches `stream`'s chat until the process is interrupted or the chat closes,
 /// appending to the transcript as it goes. Returns how many messages it wrote.
-pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool) -> Result<usize> {
+pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let path = out_dir.join(TRANSCRIPT_FILE);
@@ -74,6 +74,7 @@ pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool) -> Result<usize
 		out_dir: out_dir.to_path_buf(),
 		transcript: BufWriter::new(file),
 		pics,
+		format,
 		written: 0,
 		recorded: HashSet::new(),
 	};
@@ -94,6 +95,8 @@ struct Watcher {
 	transcript: BufWriter<File>,
 	/// Screenshot each message as well as recording it.
 	pics: bool,
+	/// What those screenshots are encoded as.
+	format: ImageFormat,
 	written: usize,
 	/// Ids already in the transcript, so a reconnect that re-reads part of the
 	/// page cannot write a message twice.
@@ -343,21 +346,11 @@ impl Watcher {
 			bail!("message has no size");
 		}
 
-		let data = tab
-			.call_method(Page::CaptureScreenshot {
-				format: Some(Page::CaptureScreenshotFormatOption::Png),
-				clip: Some(clip),
-				quality: None,
-				from_surface: Some(true),
-				capture_beyond_viewport: Some(false),
-				optimize_for_speed: None,
-			})?
-			.data;
-		let png = base64::prelude::BASE64_STANDARD.decode(data).context("decoding screenshot")?;
+		let image = browser::capture(tab, clip, self.format)?;
 
-		let file = file_name(self.written, id);
+		let file = file_name(self.written, id, self.format);
 		let path = self.out_dir.join(&file);
-		std::fs::write(&path, png).with_context(|| format!("writing {}", path.display()))?;
+		std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
 		Ok(Some(file))
 	}
 }
@@ -429,14 +422,14 @@ fn summarise(entry: &Value) -> String {
 
 /// `00001_ChwKGkNQ.png`, keeping the transcript's ordering sortable. Chat ids
 /// are long, so only the leading characters go in the name.
-fn file_name(seq: usize, id: &str) -> String {
+fn file_name(seq: usize, id: &str, format: ImageFormat) -> String {
 	let id: String = id.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(24).collect();
 	let id = if id.is_empty() {
 		"unknown".to_string()
 	} else {
 		id
 	};
-	format!("{:05}_{}.png", seq + 1, id)
+	format!("{:05}_{}.{}", seq + 1, id, format.extension())
 }
 
 #[cfg(test)]
@@ -491,8 +484,13 @@ mod tests {
 
 	#[test]
 	fn names_files_in_transcript_order() {
-		assert_eq!(file_name(0, "ChwKGkNQdi1oZXk"), "00001_ChwKGkNQdi1oZXk.png");
-		assert_eq!(file_name(41, "a/b*c"), "00042_abc.png");
-		assert_eq!(file_name(0, "///"), "00001_unknown.png");
+		assert_eq!(file_name(0, "ChwKGkNQdi1oZXk", ImageFormat::Png), "00001_ChwKGkNQdi1oZXk.png");
+		assert_eq!(file_name(41, "a/b*c", ImageFormat::Png), "00042_abc.png");
+		assert_eq!(file_name(0, "///", ImageFormat::Png), "00001_unknown.png");
+	}
+
+	#[test]
+	fn names_compressed_files_by_their_format() {
+		assert_eq!(file_name(0, "ChwKGkNQdi1oZXk", ImageFormat::Webp(80)), "00001_ChwKGkNQdi1oZXk.webp");
 	}
 }

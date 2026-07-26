@@ -206,15 +206,32 @@
     // scrolls — the message list is its own scroll container — so these are
     // already the page coordinates a capture clip wants.
     //
-    // The padding is a nicety and gets clipped to the painted band rather than
-    // insisted upon: the newest message sits flush against the bottom of the
-    // list, so there is frequently no room for it below.
+    // The padding is a nicety and gets clipped rather than insisted upon. Above
+    // and below it may only take what the gap to the neighbouring message
+    // offers: chat lines are stacked all but flush, so a full PAD upwards
+    // reaches into whoever spoke last and captures the tail of their text or
+    // the bottom of their avatar. Sideways there is no such neighbour, only the
+    // list's own margin, so the full padding stands.
     function paddedRect(el) {
         const r = el.getBoundingClientRect();
         const band = paintedBand();
+        // A neighbour that is not painted at all — a renderer we do not archive,
+        // or one YouTube has hidden — reports an empty box at the origin, which
+        // must not be mistaken for an edge to keep clear of.
+        const edge = (sib) => {
+            const b = sib ? sib.getBoundingClientRect() : null;
+            return b && b.height > 0 ? b : null;
+        };
+        const prev = edge(el.previousElementSibling);
+        const next = edge(el.nextElementSibling);
+        const ceiling = Math.max(band.top, prev ? prev.bottom : band.top);
+        const floor = Math.min(band.bottom, next ? next.top : band.bottom);
+
         const x = Math.max(0, r.left - PAD);
-        const y = Math.max(band.top, r.top - PAD);
-        const bottom = Math.min(band.bottom, r.bottom + PAD);
+        // Rounded inwards: the clip is taken at 2x, and a fractional edge
+        // smears the neighbouring row back into the picture we just excluded.
+        const y = Math.ceil(Math.max(ceiling, r.top - PAD));
+        const bottom = Math.floor(Math.min(floor, r.bottom + PAD));
         return {
             x,
             y,

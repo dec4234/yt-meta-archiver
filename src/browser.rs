@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use headless_chrome::protocol::cdp::{Emulation, Runtime};
+use base64::Engine;
+use headless_chrome::protocol::cdp::{Emulation, Page, Runtime};
 use headless_chrome::{Browser, LaunchOptions, Tab};
 use log::{debug, trace};
 use serde_json::Value;
@@ -19,6 +20,60 @@ pub const VIEWPORT: (u32, u32) = (1400, 1800);
 /// down. See the note in [`launch`]: this is deliberately far longer than any
 /// run, because a quiet page is normal here rather than a sign of trouble.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Quality a bare `--compress` uses. Captures are taken at 2x, so text survives
+/// this comfortably while the file is a fraction of the lossless one.
+const DEFAULT_QUALITY: u32 = 80;
+
+/// How a capture is encoded. Both extractors write PNG by default, which is
+/// lossless but large for a page that is mostly flat colour and text; WebP at a
+/// high quality holds up well on exactly that and costs far less disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+	Png,
+	/// WebP at the given quality, 1-100.
+	Webp(u32),
+}
+
+impl ImageFormat {
+	/// The format a `--compress [QUALITY]` argument asks for: absent leaves
+	/// captures lossless, and a bare flag (which clap gives us as 0) takes
+	/// [`DEFAULT_QUALITY`].
+	pub fn from_arg(compress: Option<u32>) -> Self {
+		match compress {
+			None => Self::Png,
+			Some(0) => Self::Webp(DEFAULT_QUALITY),
+			Some(q) => Self::Webp(q.min(100)),
+		}
+	}
+
+	/// File extension, without the dot.
+	pub fn extension(self) -> &'static str {
+		match self {
+			Self::Png => "png",
+			Self::Webp(_) => "webp",
+		}
+	}
+}
+
+/// Captures `clip` and returns the encoded image.
+pub fn capture(tab: &Tab, clip: Page::Viewport, format: ImageFormat) -> Result<Vec<u8>> {
+	let (encoding, quality) = match format {
+		ImageFormat::Png => (Page::CaptureScreenshotFormatOption::Png, None),
+		ImageFormat::Webp(q) => (Page::CaptureScreenshotFormatOption::Webp, Some(q)),
+	};
+	let data = tab
+		.call_method(Page::CaptureScreenshot {
+			format: Some(encoding),
+			clip: Some(clip),
+			quality,
+			from_surface: Some(true),
+			capture_beyond_viewport: Some(false),
+			optimize_for_speed: None,
+		})?
+		.data;
+	base64::prelude::BASE64_STANDARD.decode(data).context("decoding screenshot")
+}
 
 /// Finds a Chromium-based browser: `$CHROME_PATH` first, then the usual Chrome
 /// and Edge install locations. Edge is fine here, it speaks the same protocol.

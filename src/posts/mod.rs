@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use log::info;
 
-use crate::cli;
+use crate::{browser, cli};
 
 const DEFAULT_CHANNEL: &str = "https://www.youtube.com/@DanielLarson-ob2jw/posts";
 const DEFAULT_OUT_DIR: &str = "screenshots";
@@ -35,6 +35,12 @@ pub struct Args {
 	#[arg(long, visible_alias = "utc")]
 	details: bool,
 
+	/// Write the screenshots as WebP instead of PNG, which is a fraction of the
+	/// size at a quality that still reads cleanly. Takes the quality, 1-100,
+	/// defaulting to 80.
+	#[arg(long, value_name = "QUALITY", num_args = 0..=1, default_missing_value = "0")]
+	compress: Option<u32>,
+
 	/// Work on several posts at once: batches are captured in parallel browser
 	/// sessions and --details lookups run side by side. Takes the number of
 	/// workers, defaulting to one per core up to 4.
@@ -51,16 +57,20 @@ pub fn run(args: &Args) -> Result<()> {
 	let url = posts_url(channel);
 	let out_dir = out_dir_for(&url, &base_dir);
 	let workers = args.mt.map_or(1, cli::worker_count);
+	let format = browser::ImageFormat::from_arg(args.compress);
 	info!("channel: {url}");
 	info!("output:  {}", out_dir.display());
 	if !args.details {
 		info!("details: relative dates only (pass --details for exact dates and post text)");
 	}
+	if let browser::ImageFormat::Webp(quality) = format {
+		info!("images:  webp, quality {quality}");
+	}
 	if workers > 1 {
 		info!("workers: {workers}");
 	}
 
-	let written = archive::archive(&url, &out_dir, args.max_posts, args.details, workers)?;
+	let written = archive::archive(&url, &out_dir, args.max_posts, args.details, workers, format)?;
 	info!("wrote {written} screenshots to {}", out_dir.display());
 	info!("index:   {}", out_dir.join(archive::INDEX_FILE).display());
 	Ok(())

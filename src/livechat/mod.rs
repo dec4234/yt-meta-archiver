@@ -14,6 +14,8 @@ use std::path::PathBuf;
 use anyhow::Result;
 use log::info;
 
+use crate::browser;
+
 const DEFAULT_OUT_DIR: &str = "livechat";
 
 #[derive(clap::Args)]
@@ -25,6 +27,12 @@ pub struct Args {
 	/// Also screenshot each message, as the posts extractor does
 	#[arg(long)]
 	pic: bool,
+
+	/// Write those screenshots as WebP instead of PNG, which is a fraction of
+	/// the size at a quality that still reads cleanly. Takes the quality,
+	/// 1-100, defaulting to 80.
+	#[arg(long, value_name = "QUALITY", num_args = 0..=1, default_missing_value = "0", requires = "pic")]
+	compress: Option<u32>,
 
 	/// Transcript and screenshots are written to <OUTPUT_DIR>/<video id>
 	#[arg(long, value_name = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
@@ -41,12 +49,16 @@ pub fn run(args: &Args) -> Result<()> {
 	}
 	info!("output:  {}", out_dir.display());
 	info!("chat:    {}", out_dir.join(watch::TRANSCRIPT_FILE).display());
+	let format = browser::ImageFormat::from_arg(args.compress);
 	if args.pic {
-		info!("pics:    one screenshot per message");
+		match format {
+			browser::ImageFormat::Webp(quality) => info!("pics:    one screenshot per message, webp at quality {quality}"),
+			browser::ImageFormat::Png => info!("pics:    one screenshot per message"),
+		}
 	}
 	info!("following the chat — interrupt with Ctrl-C to stop");
 
-	let written = watch::watch(&stream, &out_dir, args.pic)?;
+	let written = watch::watch(&stream, &out_dir, args.pic, format)?;
 	info!("wrote {written} messages to {}", out_dir.join(watch::TRANSCRIPT_FILE).display());
 	Ok(())
 }
