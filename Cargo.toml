@@ -6,6 +6,9 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.0"
+clap = { version = "4.6.4", features = ["derive"] }
 headless_chrome = "1.0.22"
+log = "0.4.33"
 serde_json = "1.0.151"
+simple_logger = "5.2.0"
 ureq = "3.3.0"

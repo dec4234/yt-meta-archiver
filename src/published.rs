@@ -7,6 +7,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
+use log::trace;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
@@ -19,6 +20,7 @@ const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 /// timestamp.
 pub fn fetch_utc(post_id: &str) -> Result<String> {
     let url = format!("https://www.youtube.com/post/{post_id}");
+    trace!("fetching {url} for its publication date");
     let html = ureq::get(&url)
         .header("user-agent", USER_AGENT)
         .header("accept-language", "en-US,en")
@@ -28,6 +30,7 @@ pub fn fetch_utc(post_id: &str) -> Result<String> {
         .limit(MAX_PAGE_BYTES)
         .read_to_string()?;
 
+    trace!("read {} bytes from {url}", html.len());
     let raw = extract_date_published(&html)
         .ok_or_else(|| anyhow!("post page carried no datePublished"))?;
     to_utc(raw)

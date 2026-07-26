@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use base64::Engine;
 use headless_chrome::Tab;
+use log::{debug, info, trace, warn};
 use headless_chrome::protocol::cdp::{Emulation, Page, Runtime};
 use serde_json::Value;
 
@@ -58,6 +59,7 @@ pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_date
 	let mut index = serde_json::Map::new();
 
 	loop {
+		debug!("starting a browser session at post {}", next + 1);
 		let browser = browser::launch()?;
 		let tab = browser.new_tab()?;
 		tab.set_default_timeout(Duration::from_secs(60));
@@ -74,7 +76,7 @@ pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_date
 		if progress.next == next {
 			// The session died without capturing anything; skip the post it
 			// choked on rather than restarting on it forever.
-			eprintln!("  (no progress on post {}, skipping it)", next + 1);
+			warn!("no progress on post {}, skipping it", next + 1);
 			next += 1;
 		} else {
 			next = progress.next;
@@ -89,6 +91,7 @@ fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, 
 		"captured_at": published::now_utc(),
 		"posts": index,
 	});
+	debug!("writing index with {} entries to {}", index.len(), path.display());
 	std::fs::write(&path, serde_json::to_string_pretty(&doc)?).with_context(|| format!("writing {}", path.display()))
 }
 
@@ -120,6 +123,7 @@ impl<'a> Archiver<'a> {
 		self.emulate_dark()?;
 		self.init_viewport()?;
 
+		debug!("loading {posts_url}");
 		self.tab.navigate_to(posts_url)?.wait_until_navigated()?;
 		// YouTube renders the theme server-side from this preference, so set it
 		// and reload rather than fighting a light-theme first paint.
@@ -154,21 +158,21 @@ impl<'a> Archiver<'a> {
 		for i in start..end {
 			match self.capture_post(i) {
 				Ok((file, entry)) => {
-					println!("  [{}] {file}", i + 1);
+					info!("[{}] {file}", i + 1);
 					progress.entries.push((file, entry));
 				}
 				Err(e) => {
 					// A dead connection means the browser is gone: hand back to
 					// the caller so it can restart and resume here.
 					if !self.is_alive() {
-						eprintln!("  browser session ended at post {}, restarting", i + 1);
+						warn!("browser session ended at post {}, restarting", i + 1);
 						return Ok(Progress {
 							next: i,
 							end_of_feed: false,
 							..progress
 						});
 					}
-					eprintln!("  [{}] skipped: {e:#}", i + 1);
+					warn!("[{}] skipped: {e:#}", i + 1);
 				}
 			}
 		}
@@ -254,18 +258,19 @@ impl<'a> Archiver<'a> {
 			let count = count.max(self.count()?);
 
 			if count > last {
-				print!("\r  loaded {count} posts...");
+				debug!("loaded {count} posts...");
 				last = count;
 				stable = 0;
 			} else {
 				stable += 1;
+				trace!("no new posts ({stable}/{STABLE_ROUNDS} stable rounds)");
 				if stable >= STABLE_ROUNDS {
 					end_of_feed = true;
 					break;
 				}
 			}
 		}
-		println!("\r  loaded {last} posts   ");
+		info!("loaded {last} posts");
 		self.eval("window.scrollTo(0, 0)")?;
 		Ok((last, end_of_feed))
 	}
@@ -286,7 +291,7 @@ impl<'a> Archiver<'a> {
 				return self.eval(&format!("__yta.focus({i})"));
 			}
 			if Instant::now() > deadline {
-				eprintln!("    (post {} images still loading, capturing anyway)", i + 1);
+				warn!("post {} images still loading, capturing anyway", i + 1);
 				return Ok(info);
 			}
 			sleep(Duration::from_millis(250));
@@ -318,6 +323,7 @@ impl<'a> Archiver<'a> {
 				device_posture: None,
 			})
 			.context("resizing viewport")?;
+		trace!("viewport height {} -> {height}", self.viewport_height.get());
 		self.viewport_height.set(height);
 		sleep(Duration::from_millis(250)); // let the reflow settle
 		Ok(())
@@ -362,6 +368,7 @@ impl<'a> Archiver<'a> {
 		let mut info = self.align(i)?;
 		let overflow = info["viewTop"].as_f64().unwrap_or(0.0) + height - info["viewHeight"].as_f64().unwrap_or(0.0);
 		if overflow > 0.0 {
+			debug!("post {} overflows the viewport by {overflow:.0}px, growing", i + 1);
 			self.fit_viewport(height + overflow)?;
 			info = self.align(i)?;
 		}
@@ -387,6 +394,13 @@ impl<'a> Archiver<'a> {
 			})?
 			.data;
 		let png = base64::prelude::BASE64_STANDARD.decode(data).context("decoding screenshot")?;
+		debug!(
+			"post {} captured, {:.0}x{:.0}px, {} KiB",
+			i + 1,
+			rect["width"].as_f64().unwrap_or(0.0),
+			rect["height"].as_f64().unwrap_or(0.0),
+			png.len() / 1024
+		);
 
 		let meta = &info["meta"];
 		let id = meta["id"].as_str();
@@ -398,7 +412,7 @@ impl<'a> Archiver<'a> {
 		let posted_utc = id.filter(|_| self.fetch_dates).map(|id| match published::fetch_utc(id) {
 			Ok(date) => Value::String(date),
 			Err(e) => {
-				eprintln!("    (no exact date for post {}: {e:#})", i + 1);
+				warn!("no exact date for post {}: {e:#}", i + 1);
 				Value::Null
 			}
 		});

@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use headless_chrome::{Browser, LaunchOptions};
+use log::{debug, trace};
 
 /// Viewport used for rendering. Wide enough that YouTube uses its desktop
 /// layout and tall enough that most posts fit without `captureBeyondViewport`
@@ -19,6 +20,7 @@ fn find_browser() -> Result<PathBuf> {
 		if p.exists() {
 			return Ok(p);
 		}
+		debug!("CHROME_PATH points at {}, which does not exist; falling back", p.display());
 	}
 
 	let program_files = std::env::var("ProgramFiles").unwrap_or_default();
@@ -45,7 +47,7 @@ fn find_browser() -> Result<PathBuf> {
 
 pub fn launch() -> Result<Browser> {
 	let path = find_browser()?;
-	eprintln!("browser: {}", path.display());
+	debug!("browser: {}", path.display());
 
 	// Owned so the borrowed `&OsStr` args outlive the builder.
 	let args: Vec<OsString> = [
@@ -69,6 +71,7 @@ pub fn launch() -> Result<Browser> {
 		.args(args.iter().map(|a| a.as_os_str()).collect())
 		.build()
 		.context("failed to build launch options")?;
+	trace!("launch args: {args:?}");
 
 	Browser::new(options).context("failed to launch browser")
 }
