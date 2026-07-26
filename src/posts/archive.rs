@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use headless_chrome::Tab;
-use headless_chrome::protocol::cdp::{Emulation, Page, Runtime};
+use headless_chrome::protocol::cdp::Page;
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
@@ -246,14 +246,12 @@ impl<'a> Archiver<'a> {
 	/// Loads the posts tab in dark theme and captures up to `BATCH` posts
 	/// starting at `start`.
 	fn run_batch(&self, posts_url: &str, start: usize) -> Result<Progress> {
-		self.emulate_dark()?;
+		browser::emulate_dark(self.tab)?;
 		self.init_viewport()?;
 
 		debug!("loading {posts_url}");
 		self.tab.navigate_to(posts_url)?.wait_until_navigated()?;
-		// YouTube renders the theme server-side from this preference, so set it
-		// and reload rather than fighting a light-theme first paint.
-		self.eval("document.cookie = 'PREF=f6=400; domain=.youtube.com; path=/'")?;
+		browser::set_dark_theme_cookie(self.tab)?;
 		self.tab.reload(false, None)?.wait_until_navigated()?;
 		self.inject()?;
 
@@ -310,19 +308,6 @@ impl<'a> Archiver<'a> {
 		self.eval("1").is_ok()
 	}
 
-	/// Makes the page report a dark colour-scheme preference, which is what
-	/// YouTube's "use device theme" default follows.
-	fn emulate_dark(&self) -> Result<()> {
-		self.tab.call_method(Emulation::SetEmulatedMedia {
-			media: Some("screen".to_string()),
-			features: Some(vec![Emulation::MediaFeature {
-				name: "prefers-color-scheme".to_string(),
-				value: "dark".to_string(),
-			}]),
-		})?;
-		Ok(())
-	}
-
 	fn inject(&self) -> Result<()> {
 		self.eval(ARCHIVER_JS)?;
 		self.eval("__yta.prepare()")?;
@@ -335,33 +320,8 @@ impl<'a> Archiver<'a> {
 		self.set_viewport_height(browser::VIEWPORT.1)
 	}
 
-	/// Evaluates `expr` in the page and returns its value, reporting any
-	/// JavaScript exception rather than silently yielding nothing.
 	fn eval(&self, expr: &str) -> Result<Value> {
-		let result = self.tab.call_method(Runtime::Evaluate {
-			expression: expr.to_string(),
-			return_by_value: Some(true),
-			await_promise: Some(true),
-			user_gesture: Some(true),
-			silent: Some(false),
-			generate_preview: Some(false),
-			include_command_line_api: Some(false),
-			object_group: None,
-			context_id: None,
-			throw_on_side_effect: None,
-			timeout: None,
-			disable_breaks: None,
-			repl_mode: None,
-			allow_unsafe_eval_blocked_by_csp: None,
-			unique_context_id: None,
-			serialization_options: None,
-		})?;
-
-		if let Some(details) = result.exception_details {
-			let message = details.exception.and_then(|e| e.description).unwrap_or(details.text);
-			bail!("JS error in `{}`: {message}", expr.lines().next().unwrap_or(expr));
-		}
-		Ok(result.result.value.unwrap_or(Value::Null))
+		browser::eval(self.tab, expr)
 	}
 
 	fn count(&self) -> Result<usize> {
@@ -431,24 +391,7 @@ impl<'a> Archiver<'a> {
 		if self.viewport_height.get() == height {
 			return Ok(());
 		}
-		self.tab
-			.call_method(Emulation::SetDeviceMetricsOverride {
-				width: browser::VIEWPORT.0,
-				height,
-				device_scale_factor: 1.0,
-				mobile: false,
-				scale: None,
-				screen_width: None,
-				screen_height: None,
-				position_x: None,
-				position_y: None,
-				dont_set_visible_size: None,
-				screen_orientation: None,
-				viewport: None,
-				display_feature: None,
-				device_posture: None,
-			})
-			.context("resizing viewport")?;
+		browser::set_viewport(self.tab, browser::VIEWPORT.0, height)?;
 		trace!("viewport height {} -> {height}", self.viewport_height.get());
 		self.viewport_height.set(height);
 		sleep(Duration::from_millis(250)); // let the reflow settle

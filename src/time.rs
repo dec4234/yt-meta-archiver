@@ -14,6 +14,12 @@ pub fn now_utc() -> String {
 	format_utc(secs as i64)
 }
 
+/// Seconds since the epoch as an ISO 8601 UTC timestamp. Live chat timestamps
+/// arrive this way rather than as the offset strings post pages carry.
+pub fn from_epoch_secs(secs: i64) -> String {
+	format_utc(secs)
+}
+
 /// `2023-10-03T10:20:08.354091-07:00` -> `2023-10-03T17:20:08Z`. Fractional
 /// seconds are dropped; the offset is applied.
 pub fn to_utc(raw: &str) -> Result<String> {

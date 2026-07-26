@@ -8,6 +8,7 @@
 mod browser;
 mod cli;
 mod http;
+mod livechat;
 mod posts;
 mod time;
 
