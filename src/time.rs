@@ -1,61 +1,12 @@
-//! Details a community post's own page carries but the feed does not.
+//! Timestamps, in the one shape the archives use: ISO 8601 UTC.
 //!
-//! The feed only ever renders a relative time ("2 years ago"), and the post
-//! text it shows is the screenshot's, not something we can read back. Each
-//! post's page carries a schema.org `DiscussionForumPosting` block holding both
-//! the real timestamp and the post's text verbatim, so both come from there —
-//! reading the markup rather than OCRing the capture.
+//! Every extractor reads dates out of YouTube's markup in whatever zone the
+//! page happens to carry, and writes them normalised, so the conversion lives
+//! here rather than in any one of them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, anyhow, bail};
-use log::trace;
-use serde_json::Value;
-
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                          (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
-
-/// The JSON-LD block sits near the end of a ~750 KB page, so the whole thing
-/// has to be read; this is only a guard against a runaway response.
-const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
-
-/// What a post's page tells us about it. Every field is optional: a lookup
-/// that came back empty is still worth telling apart from one never made.
-#[derive(Clone, Default)]
-pub struct Details {
-	/// When it went up, as an ISO 8601 UTC timestamp.
-	pub published_utc: Option<String>,
-	/// Its text, absent for a post that is only an attachment.
-	pub text: Option<String>,
-}
-
-/// Fetches a post's page and reads its details off the JSON-LD block. Errors
-/// only when the page cannot be fetched or carries no such block; a field the
-/// block happens to omit comes back as `None`.
-pub fn fetch(post_id: &str) -> Result<Details> {
-	let url = format!("https://www.youtube.com/post/{post_id}");
-	trace!("fetching {url} for its details");
-	let html = ureq::get(&url)
-		.header("user-agent", USER_AGENT)
-		.header("accept-language", "en-US,en")
-		.call()?
-		.body_mut()
-		.with_config()
-		.limit(MAX_PAGE_BYTES)
-		.read_to_string()?;
-
-	trace!("read {} bytes from {url}", html.len());
-	let posting = extract_posting(&html).ok_or_else(|| anyhow!("post page carried no JSON-LD block"))?;
-
-	let published_utc = match posting["datePublished"].as_str() {
-		Some(raw) => Some(to_utc(raw)?),
-		None => None,
-	};
-	Ok(Details {
-		published_utc,
-		text: posting["text"].as_str().filter(|t| !t.is_empty()).map(str::to_string),
-	})
-}
 
 /// Now, as an ISO 8601 UTC timestamp.
 pub fn now_utc() -> String {
@@ -63,19 +14,9 @@ pub fn now_utc() -> String {
 	format_utc(secs as i64)
 }
 
-/// The page's `DiscussionForumPosting`, parsed. Going through the JSON parser
-/// rather than slicing the raw markup is what makes the text usable: it arrives
-/// escaped, and a multi-line post is nothing but escapes.
-fn extract_posting(html: &str) -> Option<Value> {
-	const OPEN: &str = "<script type=\"application/ld+json\"";
-	let rest = &html[html.find(OPEN)?..];
-	let block = &rest[rest.find('>')? + 1..rest.find("</script>")?];
-	serde_json::from_str(block).ok()
-}
-
 /// `2023-10-03T10:20:08.354091-07:00` -> `2023-10-03T17:20:08Z`. Fractional
 /// seconds are dropped; the offset is applied.
-fn to_utc(raw: &str) -> Result<String> {
+pub fn to_utc(raw: &str) -> Result<String> {
 	let bytes = raw.as_bytes();
 	if bytes.len() < 19 || bytes[10] != b'T' {
 		bail!("unrecognised timestamp {raw:?}");
@@ -177,20 +118,5 @@ mod tests {
 			assert_eq!(days_from_civil(y, m, d), days, "{days}");
 		}
 		assert_eq!(civil_from_days(0), (1970, 1, 1));
-	}
-
-	#[test]
-	fn reads_the_json_ld_block() {
-		// The shape YouTube serves, down to the nonce on the tag.
-		let html = r#"<meta name="title" content="Post from Someone"><script type="application/ld+json" nonce="wO5HIMF6">{"@type":"https://schema.org/DiscussionForumPosting","url":"https://www.youtube.com/post/abc","datePublished":"2023-10-03T10:20:08.354091-07:00","text":"line one\nline two \"quoted\""}</script><script>var ytInitialData = {};</script>"#;
-		let posting = extract_posting(html).unwrap();
-		assert_eq!(posting["datePublished"], "2023-10-03T10:20:08.354091-07:00");
-		assert_eq!(posting["text"], "line one\nline two \"quoted\"");
-	}
-
-	#[test]
-	fn survives_a_page_without_one() {
-		assert!(extract_posting("<html></html>").is_none());
-		assert!(extract_posting(r#"<script type="application/ld+json">not json</script>"#).is_none());
 	}
 }

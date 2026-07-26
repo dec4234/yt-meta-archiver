@@ -1,4 +1,7 @@
 //! Driving the posts tab: load every post, then clip a screenshot of each.
+//!
+//! A run is a series of batches, each in its own browser session, whose
+//! captures are folded into the `posts.json` index.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -14,8 +17,8 @@ use headless_chrome::protocol::cdp::{Emulation, Page, Runtime};
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
-use crate::published::Details;
-use crate::{browser, published};
+use super::details::{self, Details};
+use crate::{browser, time};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
 
@@ -36,7 +39,7 @@ const MAX_SCROLLS: u32 = 500;
 const BATCH: usize = 30;
 
 /// Sidecar index written next to the screenshots.
-pub const INDEX_FILE: &str = "posts.json";
+pub(super) const INDEX_FILE: &str = "posts.json";
 
 /// One screenshot that was written, before its exact date is looked up.
 struct Capture {
@@ -67,7 +70,7 @@ struct Progress {
 /// text, which costs one page fetch per post. `workers` batches are captured
 /// side by side, each in its own browser session; 1 keeps everything on this
 /// thread.
-pub fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize) -> Result<usize> {
+pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let mut next = 0;
@@ -204,7 +207,7 @@ fn resolve_details(captures: &[Capture], fetch_details: bool, workers: usize) ->
 /// empty, so the index records that it was tried and found nothing.
 fn fetch_details_for(capture: &Capture) -> Option<Details> {
 	let id = capture.id.as_deref()?;
-	Some(published::fetch(id).unwrap_or_else(|e| {
+	Some(details::fetch(id).unwrap_or_else(|e| {
 		warn!("no details for post {}: {e:#}", capture.index + 1);
 		Details::default()
 	}))
@@ -214,14 +217,14 @@ fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, 
 	let path = out_dir.join(INDEX_FILE);
 	let doc = serde_json::json!({
 		"channel": posts_url,
-		"captured_at": published::now_utc(),
+		"captured_at": time::now_utc(),
 		"posts": index,
 	});
 	debug!("writing index with {} entries to {}", index.len(), path.display());
 	std::fs::write(&path, serde_json::to_string_pretty(&doc)?).with_context(|| format!("writing {}", path.display()))
 }
 
-pub struct Archiver<'a> {
+struct Archiver<'a> {
 	tab: &'a Tab,
 	out_dir: PathBuf,
 	/// Stop after this many posts; used to sample a channel quickly.
@@ -550,7 +553,7 @@ impl<'a> Archiver<'a> {
 /// are worth telling apart when reading an index back.
 fn index_entry(id: Option<&str>, relative: &Value, details: Option<Details>) -> Value {
 	let mut entry = serde_json::Map::new();
-	entry.insert("url".to_string(), id.map(|id| format!("https://www.youtube.com/post/{id}")).into());
+	entry.insert("url".to_string(), id.map(super::post_url).into());
 	if let Some(details) = details {
 		entry.insert("posted_utc".to_string(), details.published_utc.into());
 		entry.insert("text".to_string(), details.text.into());
@@ -566,25 +569,4 @@ fn file_name(i: usize, id: Option<&str>) -> String {
 		.filter(|s| !s.is_empty())
 		.unwrap_or_else(|| "unknown".to_string());
 	format!("{:04}_{}.png", i + 1, id)
-}
-
-/// `https://www.youtube.com/@handle/posts` from a handle, URL, or posts URL.
-pub fn posts_url(input: &str) -> String {
-	let input = input.trim().trim_end_matches('/');
-	if input.starts_with("http") {
-		if input.ends_with("/posts") {
-			input.to_string()
-		} else {
-			format!("{input}/posts")
-		}
-	} else {
-		let handle = input.strip_prefix('@').unwrap_or(input);
-		format!("https://www.youtube.com/@{handle}/posts")
-	}
-}
-
-/// Directory name derived from the channel handle, e.g. `screenshots/DanielLarson-ob2jw`.
-pub fn out_dir_for(posts_url: &str, base: &Path) -> PathBuf {
-	let handle = posts_url.split('/').find(|s| s.starts_with('@')).map(|s| s.trim_start_matches('@')).unwrap_or("channel");
-	base.join(handle)
 }
