@@ -35,14 +35,16 @@ pub fn resolve(input: &str) -> Result<Stream> {
 
 	if let Some(video_id) = video_id_from_url(input) {
 		debug!("read video id {video_id} straight off the input");
-		return Ok(Stream { video_id, title: None });
+		return Ok(Stream {
+			video_id,
+			title: None,
+		});
 	}
 
 	let url = live_url(input);
 	debug!("asking {url} what is live");
 	let html = http::get_html(&url)?;
-	let video_id = canonical_video_id(&html)
-		.ok_or_else(|| anyhow!("{input} is not currently live (no live video at {url})"))?;
+	let video_id = canonical_video_id(&html).ok_or_else(|| anyhow!("{input} is not currently live (no live video at {url})"))?;
 
 	Ok(Stream {
 		video_id,

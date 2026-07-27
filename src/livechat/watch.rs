@@ -70,11 +70,7 @@ pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFo
 	let path = out_dir.join(TRANSCRIPT_FILE);
 	// Appended to, not truncated: re-running against the same stream after a
 	// drop continues the transcript rather than throwing it away.
-	let file = File::options()
-		.create(true)
-		.append(true)
-		.open(&path)
-		.with_context(|| format!("opening {}", path.display()))?;
+	let file = File::options().create(true).append(true).open(&path).with_context(|| format!("opening {}", path.display()))?;
 
 	let mut watcher = Watcher {
 		out_dir: out_dir.to_path_buf(),

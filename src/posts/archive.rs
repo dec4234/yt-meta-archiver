@@ -3,32 +3,24 @@
 //! A run is a series of batches, each in its own browser session, whose
 //! captures are folded into the `posts.json` index.
 
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread::sleep;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use headless_chrome::Tab;
-use headless_chrome::protocol::cdp::Page;
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
+use super::clip::Clipper;
+use super::comments::{self, Target};
 use super::details::{self, Details};
 use crate::browser::ImageFormat;
 use crate::{browser, time};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
-
-/// Tallest viewport we will grow to for one oversized post. Chromium gets
-/// unhappy allocating capture surfaces much beyond this.
-const MAX_CAPTURE_HEIGHT: u32 = 12000;
-
-/// Viewport space kept free around a post: enough for the margin `align`
-/// leaves above it, plus slack below.
-const HEADROOM: u32 = 400;
 
 /// Rounds of scrolling that must find no new posts before we call it done.
 const STABLE_ROUNDS: u32 = 3;
@@ -62,16 +54,29 @@ struct Progress {
 	captures: Vec<Capture>,
 }
 
+/// How a run is to be carried out, beyond where its output goes.
+pub(super) struct Options {
+	/// Stop after this many posts; used to sample a channel quickly.
+	pub limit: Option<usize>,
+	/// Look up each post's exact date and text, which costs a page fetch per
+	/// post.
+	pub details: bool,
+	/// Capture each post's top-level comments too, keeping those with at least
+	/// this many likes.
+	pub comments: Option<u64>,
+	/// How many posts to work on at once, each in its own browser session; 1
+	/// keeps everything on this thread.
+	pub workers: usize,
+	/// What the screenshots are encoded as.
+	pub format: ImageFormat,
+}
+
 /// Captures every post on the channel, restarting the browser between batches
 /// (and after a crash) so a long feed does not outlive the renderer. Writes
 /// `posts.json` alongside the screenshots and returns how many were written.
-///
-/// `fetch_details` turns on the per-post lookup of the exact date and post
-/// text, which costs one page fetch per post. `workers` batches are captured
-/// side by side, each in its own browser session; 1 keeps everything on this
-/// thread. `format` is what the screenshots are encoded as.
-pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fetch_details: bool, workers: usize, format: ImageFormat) -> Result<usize> {
+pub(super) fn archive(posts_url: &str, out_dir: &Path, opts: &Options) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
+	let (limit, workers) = (opts.limit, opts.workers);
 
 	let mut next = 0;
 	// Keys are zero-padded, so the map serialises in capture order.
@@ -79,15 +84,19 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fet
 
 	loop {
 		let round = if workers > 1 {
-			run_round(posts_url, out_dir, limit, next, workers, format)?
+			run_round(posts_url, out_dir, next, opts)?
 		} else {
-			run_session(posts_url, out_dir, limit, next, format)?
+			run_session(posts_url, out_dir, next, opts)?
 		};
 
-		index.extend(resolve_details(&round.captures, fetch_details, workers));
+		let mut entries = resolve_details(&round.captures, opts.details, workers);
+		if let Some(min_likes) = opts.comments {
+			attach_comments(&mut entries, &round.captures, out_dir, min_likes, workers, opts.format);
+		}
+		index.extend(entries);
 		// Rewritten after every round, so an interrupted run still leaves a
 		// usable index for the screenshots on disk.
-		write_index(out_dir, posts_url, &index)?;
+		write_index(out_dir, posts_url, opts, &index)?;
 
 		if round.end_of_feed || limit.is_some_and(|l| round.next >= l) {
 			return Ok(index.len());
@@ -104,12 +113,12 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, limit: Option<usize>, fet
 }
 
 /// One browser session, capturing the batch that starts at `start`.
-fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, format: ImageFormat) -> Result<Progress> {
+fn run_session(posts_url: &str, out_dir: &Path, start: usize, opts: &Options) -> Result<Progress> {
 	debug!("starting a browser session at post {}", start + 1);
 	let browser = browser::launch()?;
 	let tab = browser.new_tab()?;
 	tab.set_default_timeout(Duration::from_secs(60));
-	Archiver::new(&tab, out_dir, limit, format).run_batch(posts_url, start)
+	Archiver::new(&tab, out_dir, opts.limit, opts.format).run_batch(posts_url, start)
 }
 
 /// Runs up to `workers` browser sessions at once, on consecutive batches
@@ -118,15 +127,16 @@ fn run_session(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usi
 /// Every session loads the feed from the top, so a later batch pays for
 /// scrolling past the earlier ones; the capture work, which dominates, is what
 /// actually runs in parallel.
-fn run_round(posts_url: &str, out_dir: &Path, limit: Option<usize>, start: usize, workers: usize, format: ImageFormat) -> Result<Progress> {
-	let starts: Vec<usize> = (0..workers).map(|w| start + w * BATCH).take_while(|s| limit.is_none_or(|l| *s < l)).collect();
+fn run_round(posts_url: &str, out_dir: &Path, start: usize, opts: &Options) -> Result<Progress> {
+	let limit = opts.limit;
+	let starts: Vec<usize> = (0..opts.workers).map(|w| start + w * BATCH).take_while(|s| limit.is_none_or(|l| *s < l)).collect();
 	if starts.len() < 2 {
-		return run_session(posts_url, out_dir, limit, start, format);
+		return run_session(posts_url, out_dir, start, opts);
 	}
 	info!("capturing posts {}+ across {} browser sessions", start + 1, starts.len());
 
 	let results: Vec<Result<Progress>> = std::thread::scope(|scope| {
-		let handles: Vec<_> = starts.iter().map(|&s| scope.spawn(move || run_session(posts_url, out_dir, limit, s, format))).collect();
+		let handles: Vec<_> = starts.iter().map(|&s| scope.spawn(move || run_session(posts_url, out_dir, s, opts))).collect();
 		handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow!("capture thread panicked")))).collect()
 	});
 
@@ -213,11 +223,43 @@ fn fetch_details_for(capture: &Capture) -> Option<Details> {
 	}))
 }
 
-fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, Value>) -> Result<()> {
+/// Collects each captured post's top-level comments and nests them under its
+/// index entry, as `comments`. A post the feed gave no id for cannot be opened,
+/// so its entry keeps the `null` that says nothing could be read.
+///
+/// Best effort, like the details lookup: the screenshots are already on disk,
+/// and a comment section that would not load should not cost us the round.
+fn attach_comments(entries: &mut [(String, Value)], captures: &[Capture], out_dir: &Path, min_likes: u64, workers: usize, format: ImageFormat) {
+	let targets: Vec<Target> = captures
+		.iter()
+		.filter_map(|c| {
+			Some(Target {
+				index: c.index,
+				id: c.id.clone()?,
+			})
+		})
+		.collect();
+
+	let mut collected = comments::collect(&targets, out_dir, min_likes, workers, format).into_iter();
+	for (entry, capture) in entries.iter_mut().zip(captures) {
+		let found = match capture.id {
+			Some(_) => collected.next().unwrap_or(Value::Null),
+			None => Value::Null,
+		};
+		if let Some(entry) = entry.1.as_object_mut() {
+			entry.insert("comments".to_string(), found);
+		}
+	}
+}
+
+fn write_index(out_dir: &Path, posts_url: &str, opts: &Options, index: &serde_json::Map<String, Value>) -> Result<()> {
 	let path = out_dir.join(INDEX_FILE);
 	let doc = serde_json::json!({
 		"channel": posts_url,
 		"captured_at": time::now_utc(),
+		// What the nested comment lists were filtered by, so an index with few
+		// of them is not mistaken for posts that were barely commented on.
+		"comment_min_likes": opts.comments,
 		"posts": index,
 	});
 	debug!("writing index with {} entries to {}", index.len(), path.display());
@@ -226,23 +268,23 @@ fn write_index(out_dir: &Path, posts_url: &str, index: &serde_json::Map<String, 
 
 struct Archiver<'a> {
 	tab: &'a Tab,
+	/// Takes the screenshots themselves, off the same injected page.
+	clipper: Clipper<'a>,
 	out_dir: PathBuf,
 	/// Stop after this many posts; used to sample a channel quickly.
 	limit: Option<usize>,
 	/// What the screenshots are encoded as.
 	format: ImageFormat,
-	/// Current layout viewport height, to avoid redundant reflows.
-	viewport_height: Cell<u32>,
 }
 
 impl<'a> Archiver<'a> {
 	fn new(tab: &'a Tab, out_dir: impl Into<PathBuf>, limit: Option<usize>, format: ImageFormat) -> Self {
 		Self {
 			tab,
+			clipper: Clipper::new(tab, format),
 			out_dir: out_dir.into(),
 			limit,
 			format,
-			viewport_height: Cell::new(0),
 		}
 	}
 
@@ -250,7 +292,7 @@ impl<'a> Archiver<'a> {
 	/// starting at `start`.
 	fn run_batch(&self, posts_url: &str, start: usize) -> Result<Progress> {
 		browser::emulate_dark(self.tab)?;
-		self.init_viewport()?;
+		self.clipper.init_viewport()?;
 
 		debug!("loading {posts_url}");
 		self.tab.navigate_to(posts_url)?.wait_until_navigated()?;
@@ -291,7 +333,7 @@ impl<'a> Archiver<'a> {
 				Err(e) => {
 					// A dead connection means the browser is gone: hand back to
 					// the caller so it can restart and resume here.
-					if !self.is_alive() {
+					if !self.clipper.is_alive() {
 						warn!("browser session ended at post {}, restarting", i + 1);
 						return Ok(Progress {
 							next: i,
@@ -306,25 +348,14 @@ impl<'a> Archiver<'a> {
 		Ok(progress)
 	}
 
-	/// Whether the page is still reachable, i.e. the browser has not crashed.
-	fn is_alive(&self) -> bool {
-		self.eval("1").is_ok()
-	}
-
 	fn inject(&self) -> Result<()> {
 		self.eval(ARCHIVER_JS)?;
 		self.eval("__yta.prepare()")?;
 		Ok(())
 	}
 
-	/// Pins the layout viewport, which otherwise depends on the window's
-	/// chrome, so post widths are identical across runs.
-	fn init_viewport(&self) -> Result<()> {
-		self.set_viewport_height(browser::VIEWPORT.1)
-	}
-
 	fn eval(&self, expr: &str) -> Result<Value> {
-		browser::eval(self.tab, expr)
+		self.clipper.eval(expr)
 	}
 
 	fn count(&self) -> Result<usize> {
@@ -364,105 +395,11 @@ impl<'a> Archiver<'a> {
 		Ok((last, end_of_feed))
 	}
 
-	/// Brings post `i` into view and waits until its images have decoded, so a
-	/// post with an attachment is never captured half-blank.
-	fn focus_until_loaded(&self, i: usize) -> Result<Value> {
-		let deadline = Instant::now() + Duration::from_secs(20);
-		loop {
-			let info = self.eval(&format!("__yta.focus({i})"))?;
-			if !info["exists"].as_bool().unwrap_or(false) {
-				bail!("post {i} disappeared from the page");
-			}
-			if info["ready"].as_bool().unwrap_or(false) {
-				// A beat for expanded text and just-decoded images to paint,
-				// then measure the settled layout.
-				sleep(Duration::from_millis(400));
-				return self.eval(&format!("__yta.focus({i})"));
-			}
-			if Instant::now() > deadline {
-				warn!("post {} images still loading, capturing anyway", i + 1);
-				return Ok(info);
-			}
-			sleep(Duration::from_millis(250));
-		}
-	}
-
-	/// Resizes the layout viewport, keeping the width fixed so YouTube's
-	/// desktop layout and column widths do not change between posts. Resizing
-	/// reflows the feed, so this is a no-op when the height already matches.
-	fn set_viewport_height(&self, height: u32) -> Result<()> {
-		if self.viewport_height.get() == height {
-			return Ok(());
-		}
-		browser::set_viewport(self.tab, browser::VIEWPORT.0, height)?;
-		trace!("viewport height {} -> {height}", self.viewport_height.get());
-		self.viewport_height.set(height);
-		sleep(Duration::from_millis(250)); // let the reflow settle
-		Ok(())
-	}
-
-	/// Sizes the viewport so a post of `height` fits with room for the margin
-	/// `align` leaves above it.
-	fn fit_viewport(&self, height: f64) -> Result<()> {
-		let needed = height.ceil() as u32 + HEADROOM;
-		self.set_viewport_height(needed.max(browser::VIEWPORT.1).min(MAX_CAPTURE_HEIGHT))
-	}
-
-	fn align(&self, i: usize) -> Result<Value> {
-		let info = self.eval(&format!("__yta.align({i})"))?;
-		if !info["exists"].as_bool().unwrap_or(false) {
-			bail!("post {i} disappeared from the page");
-		}
-		Ok(info)
-	}
-
-	/// Scrolls post `i` into view, waits for its images, and writes the clip.
-	///
-	/// The post is captured entirely within the viewport — the viewport is
-	/// grown to fit a tall post rather than relying on `captureBeyondViewport`,
-	/// which reflows YouTube's lazily rendered feed and misaligns the clip.
-	/// Returns the screenshot's file name and the metadata its index entry
-	/// needs; the exact-date lookup happens later, off the browser session.
+	/// Screenshots post `i` and writes it out, returning the metadata its index
+	/// entry needs; the exact-date lookup happens later, off the browser
+	/// session.
 	fn capture_post(&self, i: usize) -> Result<Capture> {
-		let info = self.focus_until_loaded(i)?;
-
-		let height = info["rect"]["height"].as_f64().unwrap_or(0.0);
-		if height <= 0.0 {
-			bail!("post has zero height");
-		}
-		if height.ceil() as u32 + HEADROOM > MAX_CAPTURE_HEIGHT {
-			bail!("post is {height:.0}px tall, beyond the capture limit");
-		}
-		self.fit_viewport(height)?;
-
-		// Re-measure after the resize, immediately before capturing. If the
-		// post still runs off the bottom — near the end of the feed there may
-		// not be enough page left to scroll — grow to exactly what it needs.
-		let mut info = self.align(i)?;
-		let overflow = info["viewTop"].as_f64().unwrap_or(0.0) + height - info["viewHeight"].as_f64().unwrap_or(0.0);
-		if overflow > 0.0 {
-			debug!("post {} overflows the viewport by {overflow:.0}px, growing", i + 1);
-			self.fit_viewport(height + overflow)?;
-			info = self.align(i)?;
-		}
-
-		let rect = &info["rect"];
-		let clip = Page::Viewport {
-			x: rect["x"].as_f64().unwrap_or(0.0),
-			y: rect["y"].as_f64().unwrap_or(0.0),
-			width: rect["width"].as_f64().unwrap_or(0.0),
-			height: rect["height"].as_f64().unwrap_or(0.0),
-			scale: 2.0, // capture at 2x for legible text
-		};
-
-		let image = browser::capture(self.tab, clip, self.format)?;
-		debug!(
-			"post {} captured, {:.0}x{:.0}px, {} KiB",
-			i + 1,
-			rect["width"].as_f64().unwrap_or(0.0),
-			rect["height"].as_f64().unwrap_or(0.0),
-			image.len() / 1024
-		);
+		let (image, info) = self.clipper.capture(i)?;
 
 		let meta = &info["meta"];
 		let id = meta["id"].as_str();

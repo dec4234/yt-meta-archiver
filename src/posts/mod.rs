@@ -2,6 +2,8 @@
 //! tab, in YouTube's dark theme, and writes a `posts.json` index beside them.
 
 mod archive;
+mod clip;
+mod comments;
 mod details;
 
 use std::path::{Path, PathBuf};
@@ -34,6 +36,18 @@ pub struct Args {
 	/// without it the index records only the relative time YouTube shows.
 	#[arg(long, visible_alias = "utc")]
 	details: bool,
+
+	/// Screenshot each post's top-level comments as well, into
+	/// comments/<post>/, and record them under the post in the index. Replies
+	/// are not captured. This opens every post's own page, so it is off by
+	/// default.
+	#[arg(long)]
+	comments: bool,
+
+	/// Keep only comments with at least this many likes. Applies to --comments,
+	/// where it is the difference between a few captures per post and hundreds.
+	#[arg(long, value_name = "LIKES", default_value_t = 0, requires = "comments")]
+	min_likes: u64,
 
 	/// Write the screenshots as WebP instead of PNG, which is a fraction of the
 	/// size at a quality that still reads cleanly. Takes the quality, 1-100,
@@ -69,8 +83,22 @@ pub fn run(args: &Args) -> Result<()> {
 	if workers > 1 {
 		info!("workers: {workers}");
 	}
+	if args.comments {
+		let kept = match args.min_likes {
+			0 => "all".to_string(),
+			likes => format!("{likes}+ likes"),
+		};
+		info!("comments: top-level, {kept}");
+	}
 
-	let written = archive::archive(&url, &out_dir, args.max_posts, args.details, workers, format)?;
+	let opts = archive::Options {
+		limit: args.max_posts,
+		details: args.details,
+		comments: args.comments.then_some(args.min_likes),
+		workers,
+		format,
+	};
+	let written = archive::archive(&url, &out_dir, &opts)?;
 	info!("wrote {written} screenshots to {}", out_dir.display());
 	info!("index:   {}", out_dir.join(archive::INDEX_FILE).display());
 	Ok(())
