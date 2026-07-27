@@ -56,6 +56,12 @@ const MAX_BARREN_SESSIONS: u32 = 10;
 /// is not hammered.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// How many goes a message gets at being captured while it is still moving.
+/// Messages arrive a second or so apart at worst and a round trip is far
+/// quicker, so this is generous; past it the picture is dropped rather than
+/// kept showing the wrong message.
+const CAPTURE_ATTEMPTS: u32 = 3;
+
 /// Watches `stream`'s chat until the process is interrupted or the chat closes,
 /// appending to the transcript as it goes. Returns how many messages it wrote.
 pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat) -> Result<usize> {
@@ -323,36 +329,77 @@ impl Watcher {
 		}
 	}
 
+	/// Measuring a message and photographing it are two round trips, and chat
+	/// moves between them: one message arriving while the list is pinned to the
+	/// bottom shifts everything up a row, and the clip we asked for then holds
+	/// the tail of our message and the whole of whoever spoke next. So the
+	/// message is measured again afterwards, and a picture is only kept if it
+	/// had not moved — otherwise the fresh measurement is what the next go uses.
 	fn try_capture(&self, tab: &Tab, id: &str) -> Result<Option<String>> {
-		let info = browser::eval(tab, &format!("__ytc.locate({})", serde_json::to_string(id)?))?;
-		if !info["exists"].as_bool().unwrap_or(false) {
-			trace!("message {id} left the page before it could be captured");
-			return Ok(None);
-		}
-		if !info["onScreen"].as_bool().unwrap_or(false) {
-			trace!("message {id} scrolled out of view before it could be captured");
-			return Ok(None);
-		}
+		let mut info = locate(tab, id)?;
+		for _ in 0..CAPTURE_ATTEMPTS {
+			let Some(clip) = clip(&info, id)? else {
+				return Ok(None);
+			};
+			let image = browser::capture(tab, clip, self.format)?;
 
-		let rect = &info["rect"];
-		let clip = Page::Viewport {
-			x: rect["x"].as_f64().unwrap_or(0.0),
-			y: rect["y"].as_f64().unwrap_or(0.0),
-			width: rect["width"].as_f64().unwrap_or(0.0),
-			height: rect["height"].as_f64().unwrap_or(0.0),
-			scale: 2.0, // capture at 2x for legible text
-		};
-		if clip.width <= 0.0 || clip.height <= 0.0 {
-			bail!("message has no size");
+			let after = locate(tab, id)?;
+			if !moved(&info, &after) {
+				let file = file_name(self.written, id, self.format);
+				let path = self.out_dir.join(&file);
+				std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
+				return Ok(Some(file));
+			}
+			trace!("message {id} moved while it was being captured");
+			info = after;
 		}
-
-		let image = browser::capture(tab, clip, self.format)?;
-
-		let file = file_name(self.written, id, self.format);
-		let path = self.out_dir.join(&file);
-		std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
-		Ok(Some(file))
+		trace!("message {id} would not hold still long enough to be captured");
+		Ok(None)
 	}
+}
+
+/// Where message `id` is on the page right now.
+fn locate(tab: &Tab, id: &str) -> Result<Value> {
+	browser::eval(tab, &format!("__ytc.locate({})", serde_json::to_string(id)?))
+}
+
+/// The capture clip for a located message, or `None` if there is nothing there
+/// to photograph.
+fn clip(info: &Value, id: &str) -> Result<Option<Page::Viewport>> {
+	if !info["exists"].as_bool().unwrap_or(false) {
+		trace!("message {id} left the page before it could be captured");
+		return Ok(None);
+	}
+	if !info["onScreen"].as_bool().unwrap_or(false) {
+		trace!("message {id} scrolled out of view before it could be captured");
+		return Ok(None);
+	}
+
+	let rect = &info["rect"];
+	let clip = Page::Viewport {
+		x: rect["x"].as_f64().unwrap_or(0.0),
+		y: rect["y"].as_f64().unwrap_or(0.0),
+		width: rect["width"].as_f64().unwrap_or(0.0),
+		height: rect["height"].as_f64().unwrap_or(0.0),
+		scale: 2.0, // capture at 2x for legible text
+	};
+	if clip.width <= 0.0 || clip.height <= 0.0 {
+		bail!("message has no size");
+	}
+	Ok(Some(clip))
+}
+
+/// Whether a message's box has shifted between two measurements. A message that
+/// has gone from the page in the meantime counts as having moved, which puts the
+/// picture we took of it on the same footing: not to be kept.
+fn moved(before: &Value, after: &Value) -> bool {
+	let side = |v: &Value, k: &str| v["rect"][k].as_f64();
+	// Rounding wobble in a fractional edge is not a scroll; anything past half a
+	// pixel is. A side we cannot read at all is not evidence it stayed put.
+	["x", "y", "width", "height"].iter().any(|k| match (side(before, k), side(after, k)) {
+		(Some(a), Some(b)) => (a - b).abs() > 0.5,
+		_ => true,
+	})
 }
 
 /// Whether the page still has a live chat on it. The injected helpers are
@@ -487,6 +534,49 @@ mod tests {
 		assert_eq!(file_name(0, "ChwKGkNQdi1oZXk", ImageFormat::Png), "00001_ChwKGkNQdi1oZXk.png");
 		assert_eq!(file_name(41, "a/b*c", ImageFormat::Png), "00042_abc.png");
 		assert_eq!(file_name(0, "///", ImageFormat::Png), "00001_unknown.png");
+	}
+
+	fn located(y: f64, height: f64) -> Value {
+		serde_json::json!({
+			"exists": true,
+			"onScreen": true,
+			"rect": {"x": 8.0, "y": y, "width": 464.0, "height": height},
+		})
+	}
+
+	#[test]
+	fn keeps_a_picture_of_a_message_that_stayed_put() {
+		assert!(!moved(&located(600.0, 52.0), &located(600.0, 52.0)));
+		// Half a pixel is the rounding of a fractional edge, not a scroll.
+		assert!(!moved(&located(600.0, 52.0), &located(600.4, 52.0)));
+	}
+
+	#[test]
+	fn spots_a_message_the_chat_scrolled_out_from_under() {
+		// A message arriving below shifts this one up by its own height, which
+		// is what puts the next speaker in the picture.
+		assert!(moved(&located(600.0, 52.0), &located(574.0, 52.0)));
+		// Emoji finishing loading can reflow the message itself.
+		assert!(moved(&located(600.0, 52.0), &located(600.0, 78.0)));
+	}
+
+	#[test]
+	fn treats_a_message_that_left_the_page_as_moved() {
+		assert!(moved(&located(600.0, 52.0), &serde_json::json!({"exists": false})));
+	}
+
+	#[test]
+	fn does_not_clip_a_message_that_cannot_be_photographed() {
+		assert!(clip(&serde_json::json!({"exists": false}), "x").unwrap().is_none());
+		let offscreen = serde_json::json!({"exists": true, "onScreen": false, "rect": {"x": 8, "y": 0, "width": 464, "height": 52}});
+		assert!(clip(&offscreen, "x").unwrap().is_none());
+	}
+
+	#[test]
+	fn clips_a_located_message_at_2x() {
+		let clip = clip(&located(600.0, 52.0), "x").unwrap().expect("clip");
+		assert_eq!((clip.x, clip.y, clip.width, clip.height), (8.0, 600.0, 464.0, 52.0));
+		assert_eq!(clip.scale, 2.0);
 	}
 
 	#[test]
