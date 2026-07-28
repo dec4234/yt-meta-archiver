@@ -4,7 +4,7 @@ Archives what a YouTube channel has published. One subcommand per kind of
 thing:
 
 ```
-yt-meta-archiver posts <channel> [output_dir] [max_posts] [--details] [--comments [--min-likes n]] [--compress [quality]] [--mt [workers]]
+yt-meta-archiver posts <channel> [--max n] [--details] [--comments [--min-likes n]] [--compress [quality]] [--mt [workers]] [--out <dir>]
 ```
 
 `posts` screenshots every community post on a channel, in YouTube's dark theme,

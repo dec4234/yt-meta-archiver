@@ -16,19 +16,14 @@ const DEFAULT_CHANNEL: &str = "https://www.youtube.com/@DanielLarson-ob2jw/posts
 const DEFAULT_OUT_DIR: &str = "screenshots";
 
 #[derive(clap::Args)]
-#[command(after_help = "Pass \"\" for a positional argument to keep its default, so a later one \
-                        can be given without repeating it.")]
 pub struct Args {
 	/// Handle (@name), channel URL, or posts URL
 	#[arg(default_value = DEFAULT_CHANNEL)]
 	channel: String,
 
-	/// Screenshots are written to <OUTPUT_DIR>/<handle>
-	#[arg(default_value = DEFAULT_OUT_DIR)]
-	output_dir: String,
-
 	/// Stop after this many posts
-	max_posts: Option<usize>,
+	#[arg(long, value_name = "COUNT")]
+	max: Option<usize>,
 
 	/// Look up each post's exact publication date and text, from the post's own
 	/// page. This costs one page fetch per post, so it is off by default;
@@ -59,16 +54,15 @@ pub struct Args {
 	/// workers, defaulting to one per core up to 4.
 	#[arg(long, value_name = "WORKERS", num_args = 0..=1, default_missing_value = "0")]
 	mt: Option<usize>,
+
+	/// Screenshots are written to <OUTPUT_DIR>/<handle>
+	#[arg(long, value_name = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
+	out: PathBuf,
 }
 
 pub fn run(args: &Args) -> Result<()> {
-	// An empty positional falls back to its default, so a later argument can
-	// be given without repeating the earlier ones.
-	let channel = cli::non_empty(&args.channel).unwrap_or(DEFAULT_CHANNEL);
-	let base_dir = PathBuf::from(cli::non_empty(&args.output_dir).unwrap_or(DEFAULT_OUT_DIR));
-
-	let url = posts_url(channel);
-	let out_dir = out_dir_for(&url, &base_dir);
+	let url = posts_url(&args.channel);
+	let out_dir = out_dir_for(&url, &args.out);
 	let workers = args.mt.map_or(1, cli::worker_count);
 	let format = browser::ImageFormat::from_arg(args.compress);
 	info!("channel: {url}");
@@ -91,7 +85,7 @@ pub fn run(args: &Args) -> Result<()> {
 	}
 
 	let opts = archive::Options {
-		limit: args.max_posts,
+		limit: args.max,
 		details: args.details,
 		comments: args.comments.then_some(args.min_likes),
 		workers,

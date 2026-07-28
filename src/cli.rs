@@ -42,12 +42,6 @@ pub fn run() -> Result<()> {
 	}
 }
 
-/// A positional argument the user actually gave, as opposed to `""` standing in
-/// for its default.
-pub fn non_empty(value: &str) -> Option<&str> {
-	Some(value.trim()).filter(|v| !v.is_empty())
-}
-
 /// Workers for `--mt`. A bare `--mt` (or `--mt 0`) picks one per core, capped
 /// at 4 — each worker is a whole browser, so more of them starts costing more
 /// in memory and renderer contention than it buys back.
