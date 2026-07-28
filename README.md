@@ -19,9 +19,10 @@ yt-meta-archiver comments <video> [--min-likes n] [--max n] [--pic] [--compress 
 ```
 
 `comments` does the same for the comments under a single video, writing
-`<out>/<video id>/comments.json`. `<video>` is a watch URL, a `youtu.be` or
-`/live` link, or a bare video id. Only top-level comments are read; a thread's
-replies are left out.
+`<out>/<video id>/comments.json`. `<video>` is a watch URL, a `youtu.be`,
+`/live` or `/shorts` link, or a bare video id — a short is an ordinary video
+behind a different player, and its comments are read off the same watch page as
+any other's. Only top-level comments are read; a thread's replies are left out.
 
 `--min-likes` keeps only the comments with at least that many likes, which on a
 well-watched video is the difference between a page of them and thousands, and

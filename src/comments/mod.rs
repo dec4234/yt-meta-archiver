@@ -24,7 +24,7 @@ const DEFAULT_OUT_DIR: &str = "comments";
 
 #[derive(clap::Args)]
 pub struct Args {
-	/// Video URL (watch, youtu.be, /live or /embed link) or bare video id
+	/// Video URL (watch, youtu.be, /live, /shorts or /embed link) or bare video id
 	video: String,
 
 	/// Keep only comments with at least this many likes. On a well-watched

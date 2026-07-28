@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 const ID_LEN: usize = 11;
 
 /// The video an input names, for a command that only accepts a video: a watch,
-/// `youtu.be`, `/live` or `/embed` URL, or a bare id.
+/// `youtu.be`, `/live`, `/shorts` or `/embed` URL, or a bare id.
 pub fn resolve_id(input: &str) -> Result<String> {
 	let input = input.trim();
 	if input.is_empty() {
@@ -27,7 +27,11 @@ pub fn watch_url(video_id: &str) -> String {
 }
 
 /// The video id an input names directly, if it names one: `watch?v=ID`,
-/// `youtu.be/ID`, `/live/ID`, `/embed/ID`, or a bare id.
+/// `youtu.be/ID`, `/live/ID`, `/shorts/ID`, `/embed/ID`, or a bare id.
+///
+/// A short is an ordinary video wearing a different player, so its id is worth
+/// exactly as much here as any other: `watch?v=<short>` serves the same page,
+/// comments and all.
 pub fn id_from_url(input: &str) -> Option<String> {
 	let input = input.trim();
 	if is_id(input) {
@@ -49,7 +53,7 @@ pub fn id_from_url(input: &str) -> Option<String> {
 	match segments.as_slice() {
 		// youtu.be/ID — the id is the whole path.
 		[id] if input.contains("youtu.be/") && is_id(id) => Some(id.to_string()),
-		[kind, id, ..] if matches!(*kind, "live" | "embed" | "v") && is_id(id) => Some(id.to_string()),
+		[kind, id, ..] if matches!(*kind, "live" | "embed" | "shorts" | "v") && is_id(id) => Some(id.to_string()),
 		_ => None,
 	}
 }
@@ -69,6 +73,8 @@ mod tests {
 		assert_eq!(id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s"), id);
 		assert_eq!(id_from_url("https://youtu.be/dQw4w9WgXcQ"), id);
 		assert_eq!(id_from_url("https://www.youtube.com/live/dQw4w9WgXcQ"), id);
+		assert_eq!(id_from_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"), id);
+		assert_eq!(id_from_url("https://www.youtube.com/shorts/dQw4w9WgXcQ?feature=share"), id);
 		assert_eq!(id_from_url("https://www.youtube.com/embed/dQw4w9WgXcQ"), id);
 		assert_eq!(id_from_url("dQw4w9WgXcQ"), id);
 	}
