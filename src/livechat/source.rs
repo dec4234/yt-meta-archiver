@@ -9,10 +9,7 @@
 use anyhow::{Result, anyhow, bail};
 use log::debug;
 
-use crate::http;
-
-/// A YouTube video id: 11 characters of the URL-safe base64 alphabet.
-const ID_LEN: usize = 11;
+use crate::{http, video};
 
 /// The stream we are going to watch.
 pub struct Stream {
@@ -33,7 +30,7 @@ pub fn resolve(input: &str) -> Result<Stream> {
 		bail!("no livestream or channel given");
 	}
 
-	if let Some(video_id) = video_id_from_url(input) {
+	if let Some(video_id) = video::id_from_url(input) {
 		debug!("read video id {video_id} straight off the input");
 		return Ok(Stream {
 			video_id,
@@ -56,37 +53,6 @@ pub fn resolve(input: &str) -> Result<Stream> {
 /// than the iframe the watch page embeds, so it renders on its own.
 pub fn chat_url(video_id: &str) -> String {
 	format!("https://www.youtube.com/live_chat?v={video_id}&is_popout=1")
-}
-
-pub fn watch_url(video_id: &str) -> String {
-	format!("https://www.youtube.com/watch?v={video_id}")
-}
-
-/// The video id an input names directly, if it names one: `watch?v=ID`,
-/// `youtu.be/ID`, `/live/ID`, `/embed/ID`, or a bare id.
-fn video_id_from_url(input: &str) -> Option<String> {
-	if is_video_id(input) {
-		return Some(input.to_string());
-	}
-	if !input.starts_with("http") {
-		return None;
-	}
-
-	// Everything after the host, split into path segments and a query.
-	let rest = input.split_once("//")?.1.split_once('/').map(|(_, rest)| rest).unwrap_or("");
-	let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
-
-	if let Some(v) = query.split('&').find_map(|p| p.strip_prefix("v=")) {
-		return is_video_id(v).then(|| v.to_string());
-	}
-
-	let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-	match segments.as_slice() {
-		// youtu.be/ID — the id is the whole path.
-		[id] if input.contains("youtu.be/") && is_video_id(id) => Some(id.to_string()),
-		[kind, id, ..] if matches!(*kind, "live" | "embed" | "v") && is_video_id(id) => Some(id.to_string()),
-		_ => None,
-	}
 }
 
 /// `https://www.youtube.com/@handle/live` from a handle or channel URL.
@@ -114,7 +80,7 @@ fn canonical_video_id(html: &str) -> Option<String> {
 		Some(&html[open..close])
 	})?;
 	let href = attribute(tag, "href")?;
-	video_id_from_url(href)
+	video::id_from_url(href)
 }
 
 /// The `content` of a `<meta name="..">`, which is where the stream title is.
@@ -139,33 +105,9 @@ fn unescape_entities(raw: &str) -> String {
 	raw.replace("&quot;", "\"").replace("&#39;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
 }
 
-fn is_video_id(s: &str) -> bool {
-	s.len() == ID_LEN && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn reads_video_ids_out_of_the_usual_urls() {
-		let id = Some("dQw4w9WgXcQ".to_string());
-		assert_eq!(video_id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), id);
-		assert_eq!(video_id_from_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=42s"), id);
-		assert_eq!(video_id_from_url("https://youtu.be/dQw4w9WgXcQ"), id);
-		assert_eq!(video_id_from_url("https://www.youtube.com/live/dQw4w9WgXcQ"), id);
-		assert_eq!(video_id_from_url("https://www.youtube.com/embed/dQw4w9WgXcQ"), id);
-		assert_eq!(video_id_from_url("dQw4w9WgXcQ"), id);
-	}
-
-	#[test]
-	fn does_not_mistake_a_channel_for_a_video() {
-		assert_eq!(video_id_from_url("https://www.youtube.com/@SomeChannel"), None);
-		assert_eq!(video_id_from_url("https://www.youtube.com/@SomeChannel/live"), None);
-		assert_eq!(video_id_from_url("@SomeChannel"), None);
-		// Right shape, wrong length.
-		assert_eq!(video_id_from_url("https://www.youtube.com/watch?v=tooshort"), None);
-	}
 
 	#[test]
 	fn builds_live_urls_from_handles_and_channel_urls() {

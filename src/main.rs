@@ -2,15 +2,18 @@
 //! captured as screenshots with a JSON index beside them.
 //!
 //! Each kind of thing we pull off a channel is its own module under a
-//! subcommand of the same name; [`browser`], [`http`] and [`time`] are what
-//! they share.
+//! subcommand of the same name; [`browser`], [`clip`], [`http`], [`time`] and
+//! [`video`] are what they share.
 
 mod browser;
 mod cli;
+mod clip;
+mod comments;
 mod http;
 mod livechat;
 mod posts;
 mod time;
+mod video;
 
 use anyhow::Result;
 

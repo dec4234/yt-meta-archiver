@@ -1,10 +1,11 @@
 //! Turning one element of an injected page into a screenshot.
 //!
-//! Both the posts feed and a post's comment section are captured the same way:
-//! bring the element into view, wait for its images, grow the viewport until it
-//! fits, then clip exactly it. The page-specific half lives in the injected
-//! JavaScript, which each of them exposes as `window.__yta` with the same
-//! `focus`/`align` shape, so everything below is shared.
+//! The posts feed, a post's comment section and a video's comments are all
+//! captured the same way: bring the element into view, wait for its images,
+//! grow the viewport until it fits, then clip exactly it. The page-specific
+//! half lives in the injected JavaScript, which each of them exposes as
+//! `window.__yta` with the same `focus`/`align` shape, so everything below is
+//! shared.
 
 use std::cell::Cell;
 use std::thread::sleep;
@@ -20,14 +21,14 @@ use crate::browser::{self, ImageFormat};
 
 /// Tallest viewport we will grow to for one oversized element. Chromium gets
 /// unhappy allocating capture surfaces much beyond this.
-pub(super) const MAX_CAPTURE_HEIGHT: u32 = 12000;
+pub(crate) const MAX_CAPTURE_HEIGHT: u32 = 12000;
 
 /// Viewport space kept free around an element: enough for the margin `align`
 /// leaves above it, plus slack below.
 const HEADROOM: u32 = 400;
 
 /// Captures elements of whichever page `tab` is on, one at a time.
-pub(super) struct Clipper<'a> {
+pub(crate) struct Clipper<'a> {
 	tab: &'a Tab,
 	/// What the screenshots are encoded as.
 	format: ImageFormat,
@@ -36,7 +37,7 @@ pub(super) struct Clipper<'a> {
 }
 
 impl<'a> Clipper<'a> {
-	pub(super) fn new(tab: &'a Tab, format: ImageFormat) -> Self {
+	pub(crate) fn new(tab: &'a Tab, format: ImageFormat) -> Self {
 		Self {
 			tab,
 			format,
@@ -44,18 +45,18 @@ impl<'a> Clipper<'a> {
 		}
 	}
 
-	pub(super) fn eval(&self, expr: &str) -> Result<Value> {
+	pub(crate) fn eval(&self, expr: &str) -> Result<Value> {
 		browser::eval(self.tab, expr)
 	}
 
 	/// Whether the page is still reachable, i.e. the browser has not crashed.
-	pub(super) fn is_alive(&self) -> bool {
+	pub(crate) fn is_alive(&self) -> bool {
 		self.eval("1").is_ok()
 	}
 
 	/// Pins the layout viewport, which otherwise depends on the window's
 	/// chrome, so element widths are identical across runs.
-	pub(super) fn init_viewport(&self) -> Result<()> {
+	pub(crate) fn init_viewport(&self) -> Result<()> {
 		self.set_viewport_height(browser::VIEWPORT.1)
 	}
 
@@ -66,7 +67,7 @@ impl<'a> Clipper<'a> {
 	/// which reflows YouTube's lazily rendered feed and misaligns the clip.
 	/// Returns the encoded image alongside the settled `align` info, whose
 	/// `meta` is what the caller indexes the capture by.
-	pub(super) fn capture(&self, i: usize) -> Result<(Vec<u8>, Value)> {
+	pub(crate) fn capture(&self, i: usize) -> Result<(Vec<u8>, Value)> {
 		let info = self.focus_until_loaded(i)?;
 
 		let height = info["rect"]["height"].as_f64().unwrap_or(0.0);

@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use log::info;
 
-use crate::browser;
+use crate::{browser, video};
 
 const DEFAULT_OUT_DIR: &str = "livechat";
 
@@ -43,7 +43,7 @@ pub fn run(args: &Args) -> Result<()> {
 	let stream = source::resolve(&args.stream)?;
 	let out_dir = args.out.join(&stream.video_id);
 
-	info!("stream:  {}", source::watch_url(&stream.video_id));
+	info!("stream:  {}", video::watch_url(&stream.video_id));
 	if let Some(title) = &stream.title {
 		info!("title:   {title}");
 	}

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
-use crate::{livechat, posts};
+use crate::{comments, livechat, posts};
 
 #[derive(Parser)]
 #[command(version, about = "Archives what a YouTube channel has published.")]
@@ -26,6 +26,9 @@ enum Command {
 
 	/// Record a livestream's chat as it happens.
 	Livechat(livechat::Args),
+
+	/// Index a video's comments, optionally screenshotting them.
+	Comments(comments::Args),
 }
 
 /// Parses the command line and runs whichever extractor it names.
@@ -35,6 +38,7 @@ pub fn run() -> Result<()> {
 	match &cli.command {
 		Command::Posts(args) => posts::run(args),
 		Command::Livechat(args) => livechat::run(args),
+		Command::Comments(args) => comments::run(args),
 	}
 }
 

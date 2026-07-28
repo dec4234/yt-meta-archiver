@@ -2,7 +2,6 @@
 //! tab, in YouTube's dark theme, and writes a `posts.json` index beside them.
 
 mod archive;
-mod clip;
 mod comments;
 mod details;
 

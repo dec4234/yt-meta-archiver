@@ -18,10 +18,10 @@ use headless_chrome::{Browser, Tab};
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
-use super::clip::Clipper;
 use crate::browser::{self, ImageFormat};
-
-const COMMENTS_JS: &str = include_str!("js/comments.js");
+use crate::clip::Clipper;
+use crate::comments::COMMENTS_JS;
+use crate::comments::meta::{self, Meta};
 
 /// Screenshots go under `<out_dir>/comments/<post>/`, so the post captures
 /// themselves stay a flat, sortable list.
@@ -222,141 +222,27 @@ impl Session {
 	}
 }
 
-/// What the page says about one comment, as read off the DOM.
-#[derive(Clone, Default)]
-struct Meta {
-	id: Option<String>,
-	author: Option<String>,
-	author_url: Option<String>,
-	text: Option<String>,
-	/// Likes as a number, from the count YouTube renders.
-	likes: u64,
-	/// That count as shown, e.g. "1.2K", kept because it is what the
-	/// screenshot has in it.
-	likes_text: Option<String>,
-	replies: u64,
-	published: Option<String>,
-	pinned: bool,
-	hearted: bool,
-}
-
-impl Meta {
-	fn from_value(value: &Value) -> Self {
-		let string = |key: &str| value[key].as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
-		// The accessible label spells the count out in full where the visible
-		// one is abbreviated, so it is the better of the two when present.
-		let likes_text = string("likes");
-		let likes = string("likesLabel").as_deref().map(parse_count).filter(|n| *n > 0);
-
-		Self {
-			id: string("id"),
-			author: string("author"),
-			author_url: string("authorUrl"),
-			text: string("text"),
-			likes: likes.unwrap_or_else(|| likes_text.as_deref().map_or(0, parse_count)),
-			likes_text,
-			replies: string("replies").as_deref().map_or(0, parse_count),
-			published: string("published"),
-			pinned: value["pinned"].as_bool().unwrap_or(false),
-			hearted: value["hearted"].as_bool().unwrap_or(false),
-		}
-	}
-}
-
-/// The `posts.json` value for one comment.
+/// The `posts.json` value for one comment, pointing at the comment on the
+/// post's own page.
 fn entry(meta: &Meta, post_id: &str, screenshot: Option<&str>) -> Value {
-	serde_json::json!({
-		"url": meta.id.as_ref().map(|id| format!("{}?lc={id}", super::post_url(post_id))),
-		"author": meta.author,
-		"author_url": meta.author_url,
-		"text": meta.text,
-		"likes": meta.likes,
-		"likes_text": meta.likes_text,
-		"replies": meta.replies,
-		"pinned": meta.pinned,
-		"hearted": meta.hearted,
-		"posted_relative": meta.published,
-		"screenshot": screenshot,
-	})
+	let url = meta.id.as_ref().map(|id| format!("{}?lc={id}", super::post_url(post_id)));
+	meta::entry(meta, url, screenshot)
 }
 
 /// `0001_UgkxAbC`, matching the post's own screenshot name so the two line up
 /// when the directory is sorted.
 fn post_dir_name(target: &Target) -> String {
-	format!("{:04}_{}", target.index + 1, sanitize(Some(&target.id)))
+	format!("{:04}_{}", target.index + 1, meta::sanitize(Some(&target.id)))
 }
 
 /// `001_UgwXyZ.png`, in the order the page showed the comments.
 fn comment_file_name(ordinal: usize, id: Option<&str>, format: ImageFormat) -> String {
-	format!("{:03}_{}.{}", ordinal + 1, sanitize(id), format.extension())
-}
-
-/// A YouTube id reduced to what is safe in a file name.
-fn sanitize(id: Option<&str>) -> String {
-	id.map(|s| s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect::<String>())
-		.filter(|s| !s.is_empty())
-		.unwrap_or_else(|| "unknown".to_string())
-}
-
-/// A count as YouTube renders it — "1.2K", "1,234", "3 replies" — as a number.
-/// Anything unrecognisable counts as zero, which for a like filter errs towards
-/// leaving a comment out rather than capturing the whole feed.
-fn parse_count(raw: &str) -> u64 {
-	let Some(token) = raw.split_whitespace().next() else {
-		return 0;
-	};
-	let multiplier = match token.chars().last().map(|c| c.to_ascii_uppercase()) {
-		Some('K') => 1_000.0,
-		Some('M') => 1_000_000.0,
-		Some('B') => 1_000_000_000.0,
-		_ => 1.0,
-	};
-	let digits: String = token.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
-	digits.parse::<f64>().map_or(0, |n| (n * multiplier) as u64)
+	format!("{:03}_{}.{}", ordinal + 1, meta::sanitize(id), format.extension())
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn reads_the_counts_youtube_renders() {
-		assert_eq!(parse_count("12"), 12);
-		assert_eq!(parse_count(" 1,234 "), 1234);
-		assert_eq!(parse_count("1.2K"), 1200);
-		assert_eq!(parse_count("3.4M"), 3_400_000);
-		assert_eq!(parse_count("2B"), 2_000_000_000);
-		assert_eq!(parse_count("1,234 likes"), 1234);
-		assert_eq!(parse_count("5 replies"), 5);
-		assert_eq!(parse_count("1 reply"), 1);
-	}
-
-	#[test]
-	fn unrecognisable_counts_are_zero() {
-		assert_eq!(parse_count(""), 0);
-		assert_eq!(parse_count("   "), 0);
-		assert_eq!(parse_count("K"), 0);
-		assert_eq!(parse_count("Reply"), 0);
-	}
-
-	#[test]
-	fn prefers_the_exact_label_over_the_abbreviated_count() {
-		let meta = Meta::from_value(&serde_json::json!({"likes": "1.2K", "likesLabel": "1,234 likes"}));
-		assert_eq!(meta.likes, 1234);
-		assert_eq!(meta.likes_text.as_deref(), Some("1.2K"));
-
-		// No label, or one that says nothing: fall back to what is rendered.
-		let meta = Meta::from_value(&serde_json::json!({"likes": "1.2K", "likesLabel": null}));
-		assert_eq!(meta.likes, 1200);
-	}
-
-	#[test]
-	fn an_unliked_comment_reads_as_zero() {
-		let meta = Meta::from_value(&serde_json::json!({"likes": "", "likesLabel": null, "author": "Someone"}));
-		assert_eq!(meta.likes, 0);
-		assert_eq!(meta.likes_text, None);
-		assert_eq!(meta.author.as_deref(), Some("Someone"));
-	}
 
 	#[test]
 	fn names_captures_after_the_post_they_belong_to() {
@@ -367,5 +253,13 @@ mod tests {
 		assert_eq!(post_dir_name(&target), "0001_UgkxAbc");
 		assert_eq!(comment_file_name(0, Some("UgwXyZ"), ImageFormat::Png), "001_UgwXyZ.png");
 		assert_eq!(comment_file_name(11, None, ImageFormat::Webp(80)), "012_unknown.webp");
+	}
+
+	#[test]
+	fn points_an_entry_at_the_comment_on_the_posts_page() {
+		let meta = Meta::from_value(&serde_json::json!({"id": "UgwXyZ", "likes": "1.2K"}));
+		let value = entry(&meta, "UgkxAbc", None);
+		assert_eq!(value["url"], "https://www.youtube.com/post/UgkxAbc?lc=UgwXyZ");
+		assert_eq!(value["likes"], 1200);
 	}
 }

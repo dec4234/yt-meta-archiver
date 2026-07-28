@@ -14,10 +14,10 @@ use headless_chrome::Tab;
 use log::{debug, info, trace, warn};
 use serde_json::Value;
 
-use super::clip::Clipper;
 use super::comments::{self, Target};
 use super::details::{self, Details};
 use crate::browser::ImageFormat;
+use crate::clip::Clipper;
 use crate::{browser, time};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
