@@ -1,11 +1,15 @@
 //! Screenshots and metadata for the comments under a community post.
 //!
 //! The feed says only how many comments a post has, so each post's own page is
-//! opened and its comment section scrolled out. Only top-level comments are
-//! captured — a thread's replies hang off it and are deliberately left out of
-//! the clip — and only those clearing the like threshold are screenshotted,
-//! since that filter is the difference between a handful of captures per post
-//! and hundreds.
+//! opened and its comment section scrolled out. Only the comments clearing the
+//! like threshold are screenshotted, since that filter is the difference
+//! between a handful of captures per post and hundreds.
+//!
+//! Threads are captured a comment at a time rather than whole: the top-level
+//! comment is its own clip, and with `--subcomments` the first few replies
+//! under it are each another, nested under it in the index and written to a
+//! folder named after the comment they answer. A thread is left collapsed
+//! unless replies were asked for.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -31,11 +35,35 @@ pub(super) const COMMENTS_DIR: &str = "comments";
 const STABLE_ROUNDS: u32 = 3;
 const MAX_SCROLLS: u32 = 200;
 
+/// Times we will ask one thread for another page of replies. YouTube hands them
+/// over ten or so at a time, which is already more than `--subcomments` is
+/// usually set to.
+const MAX_REPLY_ROUNDS: u32 = 12;
+
+/// How long a page of replies is given to arrive before the thread is asked
+/// again.
+const REPLY_WAIT: Duration = Duration::from_millis(600);
+
+/// Rounds that must find no new reply before a thread is called fully loaded.
+const STABLE_REPLY_ROUNDS: u32 = 3;
+
 /// A post whose comments we want.
 pub(super) struct Target {
 	/// The post's position in the feed, which its screenshots are named after.
 	pub index: usize,
 	pub id: String,
+}
+
+/// What a run wants out of each post's comment section.
+#[derive(Clone, Copy)]
+pub(super) struct Wanted {
+	/// Keep only comments with at least this many likes.
+	pub min_likes: u64,
+	/// Capture up to this many replies under each kept comment; zero leaves
+	/// every thread collapsed.
+	pub subcomments: usize,
+	/// What the screenshots are encoded as.
+	pub format: ImageFormat,
 }
 
 /// Collects the comments of every target, returning one JSON array per target,
@@ -46,7 +74,7 @@ pub(super) struct Target {
 ///
 /// Each worker drives its own browser and takes posts off a shared cursor, so
 /// one post with thousands of comments does not leave the others idle.
-pub(super) fn collect(targets: &[Target], out_dir: &Path, min_likes: u64, workers: usize, format: ImageFormat) -> Vec<Value> {
+pub(super) fn collect(targets: &[Target], out_dir: &Path, wanted: Wanted, workers: usize) -> Vec<Value> {
 	if targets.is_empty() {
 		return Vec::new();
 	}
@@ -63,7 +91,7 @@ pub(super) fn collect(targets: &[Target], out_dir: &Path, min_likes: u64, worker
 				loop {
 					let i = cursor.fetch_add(1, Ordering::Relaxed);
 					let Some(target) = targets.get(i) else { break };
-					match run_post(&mut session, target, out_dir, min_likes, format) {
+					match run_post(&mut session, target, out_dir, wanted) {
 						Ok(comments) => results.lock().expect("comments lock poisoned")[i] = comments,
 						Err(e) => {
 							warn!("no comments for post {}: {e:#}", target.index + 1);
@@ -81,8 +109,13 @@ pub(super) fn collect(targets: &[Target], out_dir: &Path, min_likes: u64, worker
 }
 
 /// One post: load its page, read every top-level comment, and capture the ones
-/// clearing `min_likes`.
-fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, min_likes: u64, format: ImageFormat) -> Result<Value> {
+/// clearing `min_likes` along with the replies asked for under each.
+fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, wanted_opts: Wanted) -> Result<Value> {
+	let Wanted {
+		min_likes,
+		subcomments,
+		format,
+	} = wanted_opts;
 	let url = super::post_url(&target.id);
 	let open = match session.take() {
 		Some(open) => {
@@ -97,6 +130,9 @@ fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, min_
 	clipper.init_viewport()?;
 	clipper.eval(COMMENTS_JS)?;
 	clipper.eval("__yta.prepare()")?;
+	if subcomments > 0 {
+		clipper.eval("__yta.subcomments(true)")?;
+	}
 
 	let loaded = load_comments(&clipper)?;
 	if loaded == 0 {
@@ -116,13 +152,21 @@ fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, min_
 		return Ok(Value::Array(Vec::new()));
 	}
 
+	let rel_dir = format!("{COMMENTS_DIR}/{}", post_dir_name(target));
 	let dir = out_dir.join(COMMENTS_DIR).join(post_dir_name(target));
 	std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
 	let mut entries = Vec::with_capacity(wanted.len());
 	for (ordinal, &i) in wanted.iter().enumerate() {
 		let meta = &metas[i];
-		let (file, captured) = match capture_comment(&clipper, i, ordinal, meta, &dir, format) {
+		// Opening the threads before this one moves it down the capture list,
+		// so what to capture is pointed out now rather than assumed.
+		let Some(node) = select(&clipper, i, None)? else {
+			warn!("[{}] comment {} left the page", target.index + 1, ordinal + 1);
+			continue;
+		};
+		let file = capture_file_name(ordinal, meta.id.as_deref(), format);
+		let (file, captured) = match capture_node(&clipper, node, &file, &dir, &rel_dir) {
 			Ok(found) => found,
 			Err(e) => {
 				// Losing the browser here costs us the rest of this post's
@@ -145,20 +189,178 @@ fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, min_
 			},
 			_ => meta.clone(),
 		};
-		entries.push(entry(&meta, &target.id, file.as_deref()));
+
+		let mut value = entry(&meta, &target.id, file.as_deref());
+		if subcomments > 0 {
+			let thread = Thread {
+				ordinal,
+				index: i,
+				parent_id: meta.id.clone(),
+			};
+			let replies = capture_replies(&clipper, target, &dir, &rel_dir, &thread, subcomments, format);
+			if let Some(value) = value.as_object_mut() {
+				value.insert("subcomments".to_string(), Value::Array(replies));
+			}
+			if !clipper.is_alive() {
+				warn!("browser session ended on post {} comment {} replies", target.index + 1, ordinal + 1);
+				entries.push(value);
+				return Ok(Value::Array(entries));
+			}
+		}
+		entries.push(value);
 	}
 	Ok(Value::Array(entries))
 }
 
-/// Screenshots comment `i`, returning the path recorded in the index (relative
-/// to the output directory) and what the page said about it at capture time.
-fn capture_comment(clipper: &Clipper, i: usize, ordinal: usize, meta: &Meta, dir: &Path, format: ImageFormat) -> Result<(Option<String>, Option<Meta>)> {
-	let (image, info) = clipper.capture(i)?;
-	let file = comment_file_name(ordinal, meta.id.as_deref(), format);
-	let path = dir.join(&file);
+/// The top-level comment a batch of replies hangs off.
+struct Thread {
+	/// Its place among the comments kept for this post, which its screenshot
+	/// and the folder of replies under it are both named after.
+	ordinal: usize,
+	/// Its place among every thread on the page, which is how the page is asked
+	/// about it.
+	index: usize,
+	parent_id: Option<String>,
+}
+
+/// Opens `thread`'s replies and captures up to `limit` of them, in the order
+/// the page shows them, into a folder of their own under the parent comment's
+/// name.
+///
+/// Best effort throughout: a thread that will not open, or a reply that will
+/// not capture, costs only itself — the comment it hangs off is already
+/// indexed. A caller that finds the browser gone afterwards should stop.
+fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str, thread: &Thread, limit: usize, format: ImageFormat) -> Vec<Value> {
+	let (ordinal, i) = (thread.ordinal, thread.index);
+	let loaded = match load_replies(clipper, i, limit) {
+		Ok(0) => return Vec::new(),
+		Ok(loaded) => loaded,
+		Err(e) => {
+			warn!("[{}] comment {} replies did not open: {e:#}", target.index + 1, ordinal + 1);
+			return Vec::new();
+		}
+	};
+
+	let metas: Vec<Meta> = match clipper.eval(&format!("__yta.replyMetas({i})")) {
+		Ok(list) => list.as_array().map(|list| list.iter().map(Meta::from_value).collect()).unwrap_or_default(),
+		Err(e) => {
+			warn!("[{}] comment {} replies could not be read: {e:#}", target.index + 1, ordinal + 1);
+			return Vec::new();
+		}
+	};
+	let keep = metas.len().min(limit);
+	debug!("[{}] comment {} has {loaded} replies loaded, keeping {keep}", target.index + 1, ordinal + 1);
+	if keep == 0 {
+		return Vec::new();
+	}
+
+	// Made only once there is something to put in it, so a thread whose replies
+	// all fell through does not leave an empty folder behind.
+	let name = reply_dir_name(ordinal, thread.parent_id.as_deref());
+	let dir = dir.join(&name);
+	if let Err(e) = std::fs::create_dir_all(&dir) {
+		warn!("[{}] comment {} replies have nowhere to go: {e:#}", target.index + 1, ordinal + 1);
+		return Vec::new();
+	}
+	let rel_dir = format!("{rel_dir}/{name}");
+
+	let mut entries = Vec::with_capacity(keep);
+	for (r, meta) in metas.iter().enumerate().take(keep) {
+		let node = match select(clipper, i, Some(r)) {
+			Ok(Some(node)) => node,
+			Ok(None) => {
+				warn!("[{}] comment {} reply {} left the page", target.index + 1, ordinal + 1, r + 1);
+				continue;
+			}
+			Err(e) => {
+				warn!("[{}] comment {} reply {} skipped: {e:#}", target.index + 1, ordinal + 1, r + 1);
+				continue;
+			}
+		};
+		let file = capture_file_name(r, meta.id.as_deref(), format);
+		let (file, captured) = match capture_node(clipper, node, &file, &dir, &rel_dir) {
+			Ok(found) => found,
+			Err(e) => {
+				if !clipper.is_alive() {
+					entries.push(entry(meta, &target.id, None));
+					return entries;
+				}
+				warn!("[{}] comment {} reply {} skipped: {e:#}", target.index + 1, ordinal + 1, r + 1);
+				(None, None)
+			}
+		};
+		let meta = match captured {
+			Some(fresh) if fresh.text.is_some() => Meta {
+				text: fresh.text,
+				..meta.clone()
+			},
+			_ => meta.clone(),
+		};
+		entries.push(entry(&meta, &target.id, file.as_deref()));
+	}
+	entries
+}
+
+/// Clicks thread `i` open and keeps asking for more replies until `limit` of
+/// them are on the page, or the thread has no more to give. Returns how many
+/// are loaded, which the last round can leave larger than `limit` — YouTube
+/// hands them over a page at a time.
+fn load_replies(clipper: &Clipper, i: usize, limit: usize) -> Result<usize> {
+	let mut loaded = 0;
+	let mut stable = 0;
+	for _ in 0..MAX_REPLY_ROUNDS {
+		let shown = clipper.eval(&format!("__yta.showReplies({i})"))?;
+		let count = shown["count"].as_u64().unwrap_or(0) as usize;
+		let more = shown["more"].as_bool().unwrap_or(false);
+		if count > loaded {
+			trace!("comment {} has {count} replies loaded...", i + 1);
+			loaded = count;
+			stable = 0;
+		} else {
+			stable += 1;
+		}
+		// Enough to satisfy the caller; the rest of the thread is not our
+		// problem.
+		if loaded >= limit {
+			return Ok(loaded);
+		}
+		// Nothing was left to click, and what the click before it asked for has
+		// arrived: this is the whole thread. A count of zero here is instead a
+		// thread whose replies are still in flight — the click that opened it
+		// necessarily found nothing more to click — so it is waited on rather
+		// than written off.
+		if !more && loaded > 0 {
+			return Ok(loaded);
+		}
+		// A thread that has stopped growing is done whether or not it still
+		// offers something to click: its continuation stays in the markup even
+		// once it has no further page to hand over.
+		if stable >= STABLE_REPLY_ROUNDS {
+			break;
+		}
+		sleep(REPLY_WAIT);
+	}
+	Ok(loaded)
+}
+
+/// Aims the next capture at thread `i`'s comment (`reply` absent) or at its
+/// `reply`th reply, returning where it sits in the list of capturable elements,
+/// or `None` when the page no longer has it.
+fn select(clipper: &Clipper, i: usize, reply: Option<usize>) -> Result<Option<usize>> {
+	let r = reply.map_or(-1, |r| r as i64);
+	let at = clipper.eval(&format!("__yta.select({i}, {r})"))?.as_i64().unwrap_or(-1);
+	Ok(usize::try_from(at).ok())
+}
+
+/// Screenshots the element at `node`, returning the path recorded in the index
+/// (relative to the output directory) and what the page said about it at
+/// capture time.
+fn capture_node(clipper: &Clipper, node: usize, file: &str, dir: &Path, rel_dir: &str) -> Result<(Option<String>, Option<Meta>)> {
+	let (image, info) = clipper.capture(node)?;
+	let path = dir.join(file);
 	std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
 
-	let relative = format!("{COMMENTS_DIR}/{}/{file}", dir.file_name().unwrap_or_default().to_string_lossy());
+	let relative = format!("{rel_dir}/{file}");
 	debug!("wrote {relative}");
 	Ok((Some(relative), Some(Meta::from_value(&info["meta"]))))
 }
@@ -235,9 +437,18 @@ fn post_dir_name(target: &Target) -> String {
 	format!("{:04}_{}", target.index + 1, meta::sanitize(Some(&target.id)))
 }
 
-/// `001_UgwXyZ.png`, in the order the page showed the comments.
-fn comment_file_name(ordinal: usize, id: Option<&str>, format: ImageFormat) -> String {
+/// `001_UgwXyZ.png`, in the order the page showed the comments — for a reply
+/// too, numbered within the thread it belongs to rather than across the post,
+/// since it lives in a folder of that thread's own.
+fn capture_file_name(ordinal: usize, id: Option<&str>, format: ImageFormat) -> String {
 	format!("{:03}_{}.{}", ordinal + 1, meta::sanitize(id), format.extension())
+}
+
+/// `001_UgwXyZ`, the folder a comment's replies go in: the same name as the
+/// comment's own screenshot, so the two sit together when the post's directory
+/// is sorted.
+fn reply_dir_name(ordinal: usize, parent_id: Option<&str>) -> String {
+	format!("{:03}_{}", ordinal + 1, meta::sanitize(parent_id))
 }
 
 #[cfg(test)]
@@ -251,8 +462,17 @@ mod tests {
 			id: "Ugkx/../Abc".to_string(),
 		};
 		assert_eq!(post_dir_name(&target), "0001_UgkxAbc");
-		assert_eq!(comment_file_name(0, Some("UgwXyZ"), ImageFormat::Png), "001_UgwXyZ.png");
-		assert_eq!(comment_file_name(11, None, ImageFormat::Webp(80)), "012_unknown.webp");
+		assert_eq!(capture_file_name(0, Some("UgwXyZ"), ImageFormat::Png), "001_UgwXyZ.png");
+		assert_eq!(capture_file_name(11, None, ImageFormat::Webp(80)), "012_unknown.webp");
+	}
+
+	#[test]
+	fn puts_a_threads_replies_in_a_folder_named_after_it() {
+		// The comment itself is `001_UgwXyZ.png`, so its replies land in
+		// `001_UgwXyZ/` beside it.
+		assert_eq!(reply_dir_name(0, Some("UgwXyZ")), "001_UgwXyZ");
+		assert_eq!(reply_dir_name(4, Some("Ugw/../Abc")), "005_UgwAbc");
+		assert_eq!(reply_dir_name(11, None), "012_unknown");
 	}
 
 	#[test]

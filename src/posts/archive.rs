@@ -64,6 +64,9 @@ pub(super) struct Options {
 	/// Capture each post's top-level comments too, keeping those with at least
 	/// this many likes.
 	pub comments: Option<u64>,
+	/// Capture up to this many replies under each of those comments; zero
+	/// leaves every thread collapsed.
+	pub subcomments: usize,
 	/// How many posts to work on at once, each in its own browser session; 1
 	/// keeps everything on this thread.
 	pub workers: usize,
@@ -91,7 +94,12 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, opts: &Options) -> Result
 
 		let mut entries = resolve_details(&round.captures, opts.details, workers);
 		if let Some(min_likes) = opts.comments {
-			attach_comments(&mut entries, &round.captures, out_dir, min_likes, workers, opts.format);
+			let wanted = comments::Wanted {
+				min_likes,
+				subcomments: opts.subcomments,
+				format: opts.format,
+			};
+			attach_comments(&mut entries, &round.captures, out_dir, wanted, workers);
 		}
 		index.extend(entries);
 		// Rewritten after every round, so an interrupted run still leaves a
@@ -223,13 +231,13 @@ fn fetch_details_for(capture: &Capture) -> Option<Details> {
 	}))
 }
 
-/// Collects each captured post's top-level comments and nests them under its
-/// index entry, as `comments`. A post the feed gave no id for cannot be opened,
-/// so its entry keeps the `null` that says nothing could be read.
+/// Collects each captured post's comments and nests them under its index entry,
+/// as `comments`. A post the feed gave no id for cannot be opened, so its entry
+/// keeps the `null` that says nothing could be read.
 ///
 /// Best effort, like the details lookup: the screenshots are already on disk,
 /// and a comment section that would not load should not cost us the round.
-fn attach_comments(entries: &mut [(String, Value)], captures: &[Capture], out_dir: &Path, min_likes: u64, workers: usize, format: ImageFormat) {
+fn attach_comments(entries: &mut [(String, Value)], captures: &[Capture], out_dir: &Path, wanted: comments::Wanted, workers: usize) {
 	let targets: Vec<Target> = captures
 		.iter()
 		.filter_map(|c| {
@@ -240,7 +248,7 @@ fn attach_comments(entries: &mut [(String, Value)], captures: &[Capture], out_di
 		})
 		.collect();
 
-	let mut collected = comments::collect(&targets, out_dir, min_likes, workers, format).into_iter();
+	let mut collected = comments::collect(&targets, out_dir, wanted, workers).into_iter();
 	for (entry, capture) in entries.iter_mut().zip(captures) {
 		let found = match capture.id {
 			Some(_) => collected.next().unwrap_or(Value::Null),
@@ -258,8 +266,10 @@ fn write_index(out_dir: &Path, posts_url: &str, opts: &Options, index: &serde_js
 		"channel": posts_url,
 		"captured_at": time::now_utc(),
 		// What the nested comment lists were filtered by, so an index with few
-		// of them is not mistaken for posts that were barely commented on.
+		// of them is not mistaken for posts that were barely commented on, and
+		// how many replies were kept under each, for the same reason.
 		"comment_min_likes": opts.comments,
+		"comment_subcomments": opts.comments.map(|_| opts.subcomments),
 		"posts": index,
 	});
 	debug!("writing index with {} entries to {}", index.len(), path.display());

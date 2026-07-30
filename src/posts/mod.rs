@@ -33,8 +33,8 @@ pub struct Args {
 
 	/// Screenshot each post's top-level comments as well, into
 	/// comments/<post>/, and record them under the post in the index. Replies
-	/// are not captured. This opens every post's own page, so it is off by
-	/// default.
+	/// are left out unless --subcomments asks for them. This opens every post's
+	/// own page, so it is off by default.
 	#[arg(long)]
 	comments: bool,
 
@@ -42,6 +42,12 @@ pub struct Args {
 	/// where it is the difference between a few captures per post and hundreds.
 	#[arg(long, value_name = "LIKES", default_value_t = 0, requires = "comments")]
 	min_likes: u64,
+
+	/// Also capture up to this many replies under each kept comment, nested
+	/// under it in the index. Every thread taken has to be opened and waited
+	/// on, so this is the slowest part of a --comments run.
+	#[arg(long, value_name = "COUNT", default_value_t = 0, requires = "comments")]
+	subcomments: usize,
 
 	/// Write the screenshots as WebP instead of PNG, which is a fraction of the
 	/// size at a quality that still reads cleanly. Takes the quality, 1-100,
@@ -81,13 +87,18 @@ pub fn run(args: &Args) -> Result<()> {
 			0 => "all".to_string(),
 			likes => format!("{likes}+ likes"),
 		};
-		info!("comments: top-level, {kept}");
+		let depth = match args.subcomments {
+			0 => "top-level".to_string(),
+			n => format!("top-level plus up to {n} replies each"),
+		};
+		info!("comments: {depth}, {kept}");
 	}
 
 	let opts = archive::Options {
 		limit: args.max,
 		details: args.details,
 		comments: args.comments.then_some(args.min_likes),
+		subcomments: args.subcomments,
 		workers,
 		format,
 	};

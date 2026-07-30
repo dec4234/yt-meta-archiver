@@ -27,6 +27,10 @@ pub(crate) const MAX_CAPTURE_HEIGHT: u32 = 12000;
 /// leaves above it, plus slack below.
 const HEADROOM: u32 = 400;
 
+/// How long an element that measures nothing is given to render before we give
+/// up on it.
+const EMPTY_GRACE: Duration = Duration::from_millis(1500);
+
 /// Captures elements of whichever page `tab` is on, one at a time.
 pub(crate) struct Clipper<'a> {
 	tab: &'a Tab,
@@ -70,6 +74,12 @@ impl<'a> Clipper<'a> {
 	pub(crate) fn capture(&self, i: usize) -> Result<(Vec<u8>, Value)> {
 		let info = self.focus_until_loaded(i)?;
 
+		// The rect is padded, so an element that has collapsed to nothing still
+		// measures a clippable square; the page says outright when there is
+		// nothing inside it, which would otherwise be captured as blank.
+		if info["empty"].as_bool().unwrap_or(false) {
+			bail!("element occupies no space on the page");
+		}
 		let height = info["rect"]["height"].as_f64().unwrap_or(0.0);
 		if height <= 0.0 {
 			bail!("element has zero height");
@@ -114,12 +124,22 @@ impl<'a> Clipper<'a> {
 	/// one with an attachment is never captured half-blank.
 	fn focus_until_loaded(&self, i: usize) -> Result<Value> {
 		let deadline = Instant::now() + Duration::from_secs(20);
+		// An element with nothing in it is given a moment to fill in — one only
+		// just scrolled to can be a frame behind — but not the whole wait, since
+		// one that is still empty after that is not going to render at all.
+		let render_deadline = Instant::now() + EMPTY_GRACE;
 		loop {
 			let info = self.eval(&format!("__yta.focus({i})"))?;
 			if !info["exists"].as_bool().unwrap_or(false) {
 				bail!("element {i} disappeared from the page");
 			}
-			if info["ready"].as_bool().unwrap_or(false) {
+			if info["empty"].as_bool().unwrap_or(false) {
+				if Instant::now() > render_deadline {
+					// Handed back rather than raised here, so the one place that
+					// refuses an empty element is the caller.
+					return Ok(info);
+				}
+			} else if info["ready"].as_bool().unwrap_or(false) {
 				// A beat for expanded text and just-decoded images to paint,
 				// then measure the settled layout.
 				sleep(Duration::from_millis(400));
@@ -137,6 +157,9 @@ impl<'a> Clipper<'a> {
 		let info = self.eval(&format!("__yta.align({i})"))?;
 		if !info["exists"].as_bool().unwrap_or(false) {
 			bail!("element {i} disappeared from the page");
+		}
+		if info["empty"].as_bool().unwrap_or(false) {
+			bail!("element {i} collapsed to nothing while being captured");
 		}
 		Ok(info)
 	}
