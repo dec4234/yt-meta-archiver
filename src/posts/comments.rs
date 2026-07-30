@@ -24,8 +24,8 @@ use serde_json::Value;
 
 use crate::browser::{self, ImageFormat};
 use crate::clip::Clipper;
-use crate::comments::COMMENTS_JS;
 use crate::comments::meta::{self, Meta};
+use crate::comments::{COMMENTS_JS, replies};
 
 /// Screenshots go under `<out_dir>/comments/<post>/`, so the post captures
 /// themselves stay a flat, sortable list.
@@ -34,18 +34,6 @@ pub(super) const COMMENTS_DIR: &str = "comments";
 /// Rounds of scrolling that must find no new comments before we call it done.
 const STABLE_ROUNDS: u32 = 3;
 const MAX_SCROLLS: u32 = 200;
-
-/// Times we will ask one thread for another page of replies. YouTube hands them
-/// over ten or so at a time, which is already more than `--subcomments` is
-/// usually set to.
-const MAX_REPLY_ROUNDS: u32 = 12;
-
-/// How long a page of replies is given to arrive before the thread is asked
-/// again.
-const REPLY_WAIT: Duration = Duration::from_millis(600);
-
-/// Rounds that must find no new reply before a thread is called fully loaded.
-const STABLE_REPLY_ROUNDS: u32 = 3;
 
 /// A post whose comments we want.
 pub(super) struct Target {
@@ -161,7 +149,7 @@ fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, want
 		let meta = &metas[i];
 		// Opening the threads before this one moves it down the capture list,
 		// so what to capture is pointed out now rather than assumed.
-		let Some(node) = select(&clipper, i, None)? else {
+		let Some(node) = replies::select(&clipper, i, None)? else {
 			warn!("[{}] comment {} left the page", target.index + 1, ordinal + 1);
 			continue;
 		};
@@ -197,9 +185,9 @@ fn run_post(session: &mut Option<Session>, target: &Target, out_dir: &Path, want
 				index: i,
 				parent_id: meta.id.clone(),
 			};
-			let replies = capture_replies(&clipper, target, &dir, &rel_dir, &thread, subcomments, format);
+			let subs = capture_replies(&clipper, target, &dir, &rel_dir, &thread, subcomments, format);
 			if let Some(value) = value.as_object_mut() {
-				value.insert("subcomments".to_string(), Value::Array(replies));
+				value.insert("subcomments".to_string(), Value::Array(subs));
 			}
 			if !clipper.is_alive() {
 				warn!("browser session ended on post {} comment {} replies", target.index + 1, ordinal + 1);
@@ -232,7 +220,7 @@ struct Thread {
 /// indexed. A caller that finds the browser gone afterwards should stop.
 fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str, thread: &Thread, limit: usize, format: ImageFormat) -> Vec<Value> {
 	let (ordinal, i) = (thread.ordinal, thread.index);
-	let loaded = match load_replies(clipper, i, limit) {
+	let loaded = match replies::load(clipper, i, limit) {
 		Ok(0) => return Vec::new(),
 		Ok(loaded) => loaded,
 		Err(e) => {
@@ -241,8 +229,8 @@ fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str
 		}
 	};
 
-	let metas: Vec<Meta> = match clipper.eval(&format!("__yta.replyMetas({i})")) {
-		Ok(list) => list.as_array().map(|list| list.iter().map(Meta::from_value).collect()).unwrap_or_default(),
+	let metas: Vec<Meta> = match replies::metas(clipper, i) {
+		Ok(metas) => metas,
 		Err(e) => {
 			warn!("[{}] comment {} replies could not be read: {e:#}", target.index + 1, ordinal + 1);
 			return Vec::new();
@@ -256,7 +244,7 @@ fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str
 
 	// Made only once there is something to put in it, so a thread whose replies
 	// all fell through does not leave an empty folder behind.
-	let name = reply_dir_name(ordinal, thread.parent_id.as_deref());
+	let name = replies::dir_name(ordinal, thread.parent_id.as_deref());
 	let dir = dir.join(&name);
 	if let Err(e) = std::fs::create_dir_all(&dir) {
 		warn!("[{}] comment {} replies have nowhere to go: {e:#}", target.index + 1, ordinal + 1);
@@ -266,7 +254,7 @@ fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str
 
 	let mut entries = Vec::with_capacity(keep);
 	for (r, meta) in metas.iter().enumerate().take(keep) {
-		let node = match select(clipper, i, Some(r)) {
+		let node = match replies::select(clipper, i, Some(r)) {
 			Ok(Some(node)) => node,
 			Ok(None) => {
 				warn!("[{}] comment {} reply {} left the page", target.index + 1, ordinal + 1, r + 1);
@@ -299,57 +287,6 @@ fn capture_replies(clipper: &Clipper, target: &Target, dir: &Path, rel_dir: &str
 		entries.push(entry(&meta, &target.id, file.as_deref()));
 	}
 	entries
-}
-
-/// Clicks thread `i` open and keeps asking for more replies until `limit` of
-/// them are on the page, or the thread has no more to give. Returns how many
-/// are loaded, which the last round can leave larger than `limit` — YouTube
-/// hands them over a page at a time.
-fn load_replies(clipper: &Clipper, i: usize, limit: usize) -> Result<usize> {
-	let mut loaded = 0;
-	let mut stable = 0;
-	for _ in 0..MAX_REPLY_ROUNDS {
-		let shown = clipper.eval(&format!("__yta.showReplies({i})"))?;
-		let count = shown["count"].as_u64().unwrap_or(0) as usize;
-		let more = shown["more"].as_bool().unwrap_or(false);
-		if count > loaded {
-			trace!("comment {} has {count} replies loaded...", i + 1);
-			loaded = count;
-			stable = 0;
-		} else {
-			stable += 1;
-		}
-		// Enough to satisfy the caller; the rest of the thread is not our
-		// problem.
-		if loaded >= limit {
-			return Ok(loaded);
-		}
-		// Nothing was left to click, and what the click before it asked for has
-		// arrived: this is the whole thread. A count of zero here is instead a
-		// thread whose replies are still in flight — the click that opened it
-		// necessarily found nothing more to click — so it is waited on rather
-		// than written off.
-		if !more && loaded > 0 {
-			return Ok(loaded);
-		}
-		// A thread that has stopped growing is done whether or not it still
-		// offers something to click: its continuation stays in the markup even
-		// once it has no further page to hand over.
-		if stable >= STABLE_REPLY_ROUNDS {
-			break;
-		}
-		sleep(REPLY_WAIT);
-	}
-	Ok(loaded)
-}
-
-/// Aims the next capture at thread `i`'s comment (`reply` absent) or at its
-/// `reply`th reply, returning where it sits in the list of capturable elements,
-/// or `None` when the page no longer has it.
-fn select(clipper: &Clipper, i: usize, reply: Option<usize>) -> Result<Option<usize>> {
-	let r = reply.map_or(-1, |r| r as i64);
-	let at = clipper.eval(&format!("__yta.select({i}, {r})"))?.as_i64().unwrap_or(-1);
-	Ok(usize::try_from(at).ok())
 }
 
 /// Screenshots the element at `node`, returning the path recorded in the index
@@ -444,13 +381,6 @@ fn capture_file_name(ordinal: usize, id: Option<&str>, format: ImageFormat) -> S
 	format!("{:03}_{}.{}", ordinal + 1, meta::sanitize(id), format.extension())
 }
 
-/// `001_UgwXyZ`, the folder a comment's replies go in: the same name as the
-/// comment's own screenshot, so the two sit together when the post's directory
-/// is sorted.
-fn reply_dir_name(ordinal: usize, parent_id: Option<&str>) -> String {
-	format!("{:03}_{}", ordinal + 1, meta::sanitize(parent_id))
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -464,15 +394,6 @@ mod tests {
 		assert_eq!(post_dir_name(&target), "0001_UgkxAbc");
 		assert_eq!(capture_file_name(0, Some("UgwXyZ"), ImageFormat::Png), "001_UgwXyZ.png");
 		assert_eq!(capture_file_name(11, None, ImageFormat::Webp(80)), "012_unknown.webp");
-	}
-
-	#[test]
-	fn puts_a_threads_replies_in_a_folder_named_after_it() {
-		// The comment itself is `001_UgwXyZ.png`, so its replies land in
-		// `001_UgwXyZ/` beside it.
-		assert_eq!(reply_dir_name(0, Some("UgwXyZ")), "001_UgwXyZ");
-		assert_eq!(reply_dir_name(4, Some("Ugw/../Abc")), "005_UgwAbc");
-		assert_eq!(reply_dir_name(11, None), "012_unknown");
 	}
 
 	#[test]

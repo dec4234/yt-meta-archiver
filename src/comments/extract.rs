@@ -1,10 +1,14 @@
 //! Driving a video's watch page: load its comments, keep the ones worth
 //! keeping, and write an index of them.
 //!
-//! Only top-level comments are read — a thread's replies hang off it and are
-//! deliberately left out — and the like threshold is applied before any
-//! screenshot is taken, since on a busy video that filter is the difference
-//! between a page of captures and thousands.
+//! The like threshold is applied before any screenshot is taken, since on a busy
+//! video that filter is the difference between a page of captures and thousands.
+//!
+//! Threads are read a comment at a time rather than whole: the top-level comment
+//! is its own entry, and with `--subcomments` the first few replies under it are
+//! each another, nested under it in the index and — when pictures were asked for
+//! — screenshotted into a folder named after the comment they answer. A thread is
+//! left collapsed unless replies were asked for.
 
 use std::path::Path;
 use std::thread::sleep;
@@ -15,6 +19,7 @@ use log::{debug, info, trace, warn};
 use serde_json::Value;
 
 use super::meta::{self, Meta};
+use super::replies;
 use crate::browser::ImageFormat;
 use crate::clip::Clipper;
 use crate::{browser, time, video};
@@ -38,6 +43,9 @@ pub(super) struct Options {
 	pub min_likes: u64,
 	/// Stop after this many kept comments.
 	pub max: Option<usize>,
+	/// Record up to this many replies under each kept comment; zero leaves every
+	/// thread collapsed.
+	pub subcomments: usize,
 	/// Screenshot each kept comment as well as recording it.
 	pub pics: bool,
 	/// What those screenshots are encoded as.
@@ -65,6 +73,9 @@ pub(super) fn extract(video_id: &str, out_dir: &Path, opts: &Options) -> Result<
 	clipper.init_viewport()?;
 	clipper.eval(super::COMMENTS_JS)?;
 	clipper.eval("__yta.prepare()")?;
+	if opts.subcomments > 0 {
+		clipper.eval("__yta.subcomments(true)")?;
+	}
 
 	let loaded = load_comments(&clipper, opts)?;
 	// Read once the page has settled: straight after the reload the title is
@@ -107,23 +118,24 @@ pub(super) fn extract(video_id: &str, out_dir: &Path, opts: &Options) -> Result<
 }
 
 /// Turns the wanted comments into index entries, capturing each one first when
-/// `pics` is set.
+/// `pics` is set, and nesting whatever replies were asked for under it.
 fn collect(clipper: &Clipper, metas: &[Meta], wanted: &[usize], video_id: &str, out_dir: &Path, opts: &Options) -> Vec<Value> {
 	let mut entries = Vec::with_capacity(wanted.len());
 	for (ordinal, &i) in wanted.iter().enumerate() {
 		let mut meta = metas[i].clone();
+		let mut file = None;
 		if opts.pics {
-			match capture(clipper, i, ordinal, &meta, out_dir, opts.format) {
-				Ok((file, fresh)) => {
+			match capture_comment(clipper, i, ordinal, &meta, out_dir, opts) {
+				Ok(Some((name, fresh))) => {
 					// The capture expands a clamped body, so its text is the
 					// fuller one.
 					if fresh.text.is_some() {
 						meta.text = fresh.text;
 					}
-					info!("[{}] {file}", ordinal + 1);
-					entries.push(entry(&meta, video_id, Some(&file)));
-					continue;
+					info!("[{}] {name}", ordinal + 1);
+					file = Some(name);
 				}
+				Ok(None) => warn!("[{}] left the page before it could be captured", ordinal + 1),
 				Err(e) => {
 					// Losing the browser costs us the remaining captures, so
 					// record what is left without pictures rather than throwing
@@ -137,19 +149,156 @@ fn collect(clipper: &Clipper, metas: &[Meta], wanted: &[usize], video_id: &str, 
 				}
 			}
 		}
-		entries.push(entry(&meta, video_id, None));
+
+		let mut value = entry(&meta, video_id, file.as_deref());
+		if opts.subcomments > 0 {
+			let thread = Thread {
+				ordinal,
+				index: i,
+				parent_id: meta.id.clone(),
+			};
+			let subs = collect_replies(clipper, &thread, video_id, out_dir, opts);
+			if let Some(value) = value.as_object_mut() {
+				value.insert("subcomments".to_string(), Value::Array(subs));
+			}
+			// Same bargain as a lost capture: what is already read is worth more
+			// than the rest of the run, which has no browser left to make it in.
+			if !clipper.is_alive() {
+				warn!("browser session ended on comment {} replies; the rest are recorded without replies or pictures", ordinal + 1);
+				entries.push(value);
+				entries.extend(wanted[ordinal + 1..].iter().map(|&i| entry(&metas[i], video_id, None)));
+				return entries;
+			}
+		}
+		entries.push(value);
 	}
 	entries
 }
 
+/// The top-level comment a batch of replies hangs off.
+struct Thread {
+	/// Its place among the comments kept for this video, which its screenshot and
+	/// the folder of replies under it are both named after.
+	ordinal: usize,
+	/// Its place among every thread on the page, which is how the page is asked
+	/// about it.
+	index: usize,
+	parent_id: Option<String>,
+}
+
 /// Screenshots comment `i`, returning the file name recorded in the index and
-/// what the page said about it at capture time.
-fn capture(clipper: &Clipper, i: usize, ordinal: usize, meta: &Meta, out_dir: &Path, format: ImageFormat) -> Result<(String, Meta)> {
-	let (image, info) = clipper.capture(i)?;
-	let file = file_name(ordinal, meta.id.as_deref(), format);
-	let path = out_dir.join(&file);
+/// what the page said about it at capture time, or `None` for a comment the page
+/// no longer has.
+fn capture_comment(clipper: &Clipper, i: usize, ordinal: usize, meta: &Meta, out_dir: &Path, opts: &Options) -> Result<Option<(String, Meta)>> {
+	// With replies in the capture list, opening the threads before this one has
+	// moved it along, so where it sits now is asked rather than assumed.
+	let node = if opts.subcomments > 0 {
+		match replies::select(clipper, i, None)? {
+			Some(node) => node,
+			None => return Ok(None),
+		}
+	} else {
+		i
+	};
+	let file = file_name(ordinal, meta.id.as_deref(), opts.format);
+	let captured = capture_node(clipper, node, &file, out_dir)?;
+	Ok(Some((file, captured)))
+}
+
+/// Opens `thread`'s replies and records up to `--subcomments` of them, in the
+/// order the page shows them, screenshotting each into a folder of its own under
+/// the parent comment's name when pictures were asked for.
+///
+/// Best effort throughout: a thread that will not open, or a reply that will not
+/// capture, costs only itself — the comment it hangs off is already indexed. A
+/// caller that finds the browser gone afterwards should stop.
+fn collect_replies(clipper: &Clipper, thread: &Thread, video_id: &str, out_dir: &Path, opts: &Options) -> Vec<Value> {
+	let (ordinal, i, limit) = (thread.ordinal, thread.index, opts.subcomments);
+	let loaded = match replies::load(clipper, i, limit) {
+		Ok(0) => return Vec::new(),
+		Ok(loaded) => loaded,
+		Err(e) => {
+			warn!("[{}] replies did not open: {e:#}", ordinal + 1);
+			return Vec::new();
+		}
+	};
+
+	let metas = match replies::metas(clipper, i) {
+		Ok(metas) => metas,
+		Err(e) => {
+			warn!("[{}] replies could not be read: {e:#}", ordinal + 1);
+			return Vec::new();
+		}
+	};
+	let keep = metas.len().min(limit);
+	debug!("[{}] {loaded} replies loaded, keeping {keep}", ordinal + 1);
+	if keep == 0 {
+		return Vec::new();
+	}
+
+	// Made only once there is something to put in it, so a thread whose replies
+	// all fell through does not leave an empty folder behind. A metadata-only run
+	// needs no folder at all.
+	let dir_name = replies::dir_name(ordinal, thread.parent_id.as_deref());
+	let dir = out_dir.join(&dir_name);
+	if opts.pics
+		&& let Err(e) = std::fs::create_dir_all(&dir)
+	{
+		warn!("[{}] replies have nowhere to go: {e:#}", ordinal + 1);
+		return Vec::new();
+	}
+
+	let mut entries = Vec::with_capacity(keep);
+	for (r, meta) in metas.iter().enumerate().take(keep) {
+		let mut meta = meta.clone();
+		let mut file = None;
+		if opts.pics {
+			match capture_reply(clipper, i, r, &meta, &dir, opts.format) {
+				Ok(Some((captured, fresh))) => {
+					if fresh.text.is_some() {
+						meta.text = fresh.text;
+					}
+					// Recorded the way a comment's own screenshot is: a path
+					// relative to the output directory.
+					let relative = format!("{dir_name}/{captured}");
+					info!("[{}.{}] {relative}", ordinal + 1, r + 1);
+					file = Some(relative);
+				}
+				Ok(None) => warn!("[{}.{}] reply left the page", ordinal + 1, r + 1),
+				Err(e) => {
+					if !clipper.is_alive() {
+						entries.push(entry(&meta, video_id, None));
+						return entries;
+					}
+					warn!("[{}.{}] reply not captured: {e:#}", ordinal + 1, r + 1);
+				}
+			}
+		}
+		entries.push(entry(&meta, video_id, file.as_deref()));
+	}
+	entries
+}
+
+/// Screenshots thread `i`'s `r`th reply into `dir`, returning the file name it
+/// was written under and what the page said about it at capture time.
+fn capture_reply(clipper: &Clipper, i: usize, r: usize, meta: &Meta, dir: &Path, format: ImageFormat) -> Result<Option<(String, Meta)>> {
+	let Some(node) = replies::select(clipper, i, Some(r))? else {
+		return Ok(None);
+	};
+	// Numbered within the thread it belongs to rather than across the video, since
+	// it lives in a folder of that thread's own.
+	let file = file_name(r, meta.id.as_deref(), format);
+	let captured = capture_node(clipper, node, &file, dir)?;
+	Ok(Some((file, captured)))
+}
+
+/// Screenshots the element at `node` into `dir`, returning what the page said
+/// about it at capture time.
+fn capture_node(clipper: &Clipper, node: usize, file: &str, dir: &Path) -> Result<Meta> {
+	let (image, info) = clipper.capture(node)?;
+	let path = dir.join(file);
 	std::fs::write(&path, image).with_context(|| format!("writing {}", path.display()))?;
-	Ok((file, Meta::from_value(&info["meta"])))
+	Ok(Meta::from_value(&info["meta"]))
 }
 
 /// Scrolls the watch page until every top-level comment has loaded, or until
@@ -243,6 +392,9 @@ fn write_index(out_dir: &Path, video_id: &str, title: Option<&str>, opts: &Optio
 		// video that was barely commented on.
 		"min_likes": opts.min_likes,
 		"max": opts.max,
+		// How many replies were kept under each comment, so a thread that reads as
+		// short in the index is not mistaken for one that was barely replied to.
+		"subcomments": opts.subcomments,
 		"comments_loaded": loaded,
 		"comments": entries,
 	});

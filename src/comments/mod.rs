@@ -1,13 +1,14 @@
-//! The video-comments extractor: reads the comments under a single video and
-//! writes a `comments.json` index of them, optionally screenshotting each one
-//! in YouTube's dark theme.
+//! The video-comments extractor: reads the comments under a single video —
+//! their replies too, when asked for — and writes a `comments.json` index of
+//! them, optionally screenshotting each one in YouTube's dark theme.
 //!
-//! The comment markup is the same wherever comments hang, so [`meta`] and the
-//! injected script are shared with the community-post extractor, which captures
-//! the comments under a post as part of archiving it.
+//! The comment markup is the same wherever comments hang, so [`meta`],
+//! [`replies`] and the injected script are shared with the community-post
+//! extractor, which captures the comments under a post as part of archiving it.
 
 mod extract;
 pub(crate) mod meta;
+pub(crate) mod replies;
 
 use std::path::PathBuf;
 
@@ -38,6 +39,13 @@ pub struct Args {
 	#[arg(long, value_name = "COUNT")]
 	max: Option<usize>,
 
+	/// Also record up to this many replies under each kept comment, nested under
+	/// it in the index and screenshotted too when --pic is set. Every thread
+	/// taken has to be opened and waited on, so this is the slowest part of a
+	/// run.
+	#[arg(long, value_name = "COUNT", default_value_t = 0)]
+	subcomments: usize,
+
 	/// Also screenshot each kept comment, as the posts extractor does, and name
 	/// the file in the index. Without it the run is metadata only — the page is
 	/// still opened in a browser, there being no other way to read the comments.
@@ -63,9 +71,13 @@ pub fn run(args: &Args) -> Result<()> {
 	info!("video:   {}", video::watch_url(&video_id));
 	info!("output:  {}", out_dir.display());
 	info!("index:   {}", out_dir.join(extract::INDEX_FILE).display());
-	match args.min_likes {
-		0 => info!("keeping: all top-level comments"),
-		likes => info!("keeping: top-level comments with {likes}+ likes"),
+	let kept = match args.min_likes {
+		0 => "all top-level comments".to_string(),
+		likes => format!("top-level comments with {likes}+ likes"),
+	};
+	match args.subcomments {
+		0 => info!("keeping: {kept}"),
+		n => info!("keeping: {kept}, plus up to {n} replies each"),
 	}
 	if let Some(max) = args.max {
 		info!("max:     {max} comments");
@@ -80,6 +92,7 @@ pub fn run(args: &Args) -> Result<()> {
 	let opts = extract::Options {
 		min_likes: args.min_likes,
 		max: args.max,
+		subcomments: args.subcomments,
 		pics: args.pic,
 		format,
 	};

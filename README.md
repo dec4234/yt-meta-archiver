@@ -4,7 +4,7 @@ Archives what a YouTube channel has published. One subcommand per kind of
 thing:
 
 ```
-yt-meta-archiver posts <channel> [--max n] [--details] [--comments [--min-likes n]] [--compress [quality]] [--mt [workers]] [--out <dir>]
+yt-meta-archiver posts <channel> [--max n] [--details] [--comments [--min-likes n] [--subcomments n]] [--compress [quality]] [--mt [workers]] [--out <dir>]
 ```
 
 `posts` screenshots every community post on a channel, in YouTube's dark theme,
@@ -12,25 +12,30 @@ and writes a `posts.json` index beside the images. `--details` additionally
 looks up each post's exact publication date and text from the post's own page,
 and `--comments` opens each post and screenshots its top-level comments into
 `comments/<post>/`, recording them under the post in the index. Both cost a page
-load per post, so both are off by default.
+load per post, so both are off by default. `--subcomments n` additionally opens
+each of those comments and captures up to `n` of its replies, into a folder named
+after the comment they answer and nested under it in the index.
 
 ```
-yt-meta-archiver comments <video> [--min-likes n] [--max n] [--pic] [--compress [quality]] [--out <dir>]
+yt-meta-archiver comments <video> [--min-likes n] [--max n] [--subcomments n] [--pic] [--compress [quality]] [--out <dir>]
 ```
 
 `comments` does the same for the comments under a single video, writing
 `<out>/<video id>/comments.json`. `<video>` is a watch URL, a `youtu.be`,
 `/live` or `/shorts` link, or a bare video id — a short is an ordinary video
 behind a different player, and its comments are read off the same watch page as
-any other's. Only top-level comments are read; a thread's replies are left out.
+any other's. Threads are left collapsed unless `--subcomments` asks for them.
 
 `--min-likes` keeps only the comments with at least that many likes, which on a
 well-watched video is the difference between a page of them and thousands, and
 `--max` stops after that many have been kept — loading stops as soon as enough
-are on the page, so it bounds the work as well as the output. `--pic`
-screenshots each kept comment and names the file in the index; without it the
-run is metadata only, though the page is still opened in a browser, there being
-no other way to read the comments.
+are on the page, so it bounds the work as well as the output. `--subcomments n`
+opens each kept comment and records up to `n` of its replies, nested under it in
+the index; every thread taken has to be opened and waited on, so it is the
+slowest part of a run. `--pic` screenshots each kept comment — and each reply,
+into a folder named after the comment it answers — and names the file in the
+index; without it the run is metadata only, though the page is still opened in a
+browser, there being no other way to read the comments.
 
 ```
 yt-meta-archiver livechat <stream> [--pic] [--compress [quality]] [--out <dir>]
