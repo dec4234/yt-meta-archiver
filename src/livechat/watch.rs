@@ -415,7 +415,11 @@ fn is_alive(tab: &Tab) -> bool {
 ///
 /// `at` is our own arrival time, always present. `sent_utc` is YouTube's own
 /// timestamp for the message, which is the one to trust when it is there.
-fn entry(message: &Value, seq: usize, pic: Option<&str>) -> Value {
+///
+/// Shared with [`super::replay`], which reads the same fields off the API rather
+/// than the DOM: a transcript should describe a message the same way whether it
+/// was caught live or read back afterwards.
+pub(super) fn entry(message: &Value, seq: usize, pic: Option<&str>) -> Value {
 	let mut entry = serde_json::Map::new();
 	entry.insert("seq".to_string(), (seq + 1).into());
 	entry.insert("id".to_string(), message["id"].clone());
@@ -447,7 +451,7 @@ fn sent_utc(message: &Value) -> Option<String> {
 }
 
 /// A one-line rendering of a message, for the console.
-fn summarise(entry: &Value) -> String {
+pub(super) fn summarise(entry: &Value) -> String {
 	let author = entry["author"].as_str().unwrap_or("(unknown)");
 	let text = entry["text"].as_str().unwrap_or("");
 	let kind = entry["kind"].as_str().unwrap_or("text");
