@@ -3,6 +3,10 @@ name = "yt-meta-archiver"
 version = "0.1.0"
 edition = "2024"
 
+[workspace]
+members = [".", "livechat-analyze"]
+default-members = [".", "livechat-analyze"]
+
 [dependencies]
 anyhow = "1.0.104"
 base64 = "0.23.0"
