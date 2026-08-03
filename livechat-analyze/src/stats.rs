@@ -21,10 +21,28 @@ const TARGET_BUCKETS: i64 = 40;
 
 /// One chatter.
 pub struct AuthorStat {
+	/// What they were grouped by — see [`Record::author_key`]. Kept so `--author`
+	/// can be given a channel id, which is the only handle-proof way to name
+	/// someone.
+	pub key: String,
 	pub name: String,
 	pub count: usize,
 	pub badges: BTreeSet<String>,
 	pub money: BTreeMap<String, f64>,
+	/// This chatter's messages in stream time, in the same shape as
+	/// [`Stats::offsets`] so they can be bucketed by the same code. Kept per
+	/// author rather than recomputed by filtering, because the dashboard changes
+	/// which author is in focus on a keypress.
+	pub offsets: Vec<Option<i64>>,
+}
+
+impl AuthorStat {
+	/// When they first and last spoke, in stream time.
+	pub fn range(&self) -> Option<(i64, i64)> {
+		let mut placed = self.offsets.iter().flatten().copied();
+		let first = placed.next()?;
+		Some(placed.fold((first, first), |(lo, hi), at| (lo.min(at), hi.max(at))))
+	}
 }
 
 /// One currency's takings. No conversion between them — an exchange rate is a
@@ -95,16 +113,20 @@ pub fn collect(records: &[Record], failures: usize) -> Stats {
 	let mut unparsable_amounts = 0;
 	let mut lengths = Vec::new();
 
-	for record in records {
+	for (record, offset) in records.iter().zip(&offsets) {
 		*kinds.entry(record.kind.clone()).or_default() += 1;
 
-		let author = authors.entry(record.author_key()).or_insert_with(|| AuthorStat {
+		let key = record.author_key();
+		let author = authors.entry(key.clone()).or_insert_with(|| AuthorStat {
+			key,
 			name: record.display_name(),
 			count: 0,
 			badges: BTreeSet::new(),
 			money: BTreeMap::new(),
+			offsets: Vec::new(),
 		});
 		author.count += 1;
+		author.offsets.push(*offset);
 
 		for badge in &record.badges {
 			author.badges.insert(badge.clone());
@@ -192,6 +214,26 @@ impl Buckets {
 		self.start_ms + index as i64 * self.size_ms
 	}
 
+	/// A subset of the messages counted on *this* grid rather than on one of
+	/// their own.
+	///
+	/// One chatter's messages bucketed independently would start at their first
+	/// message and end at their last, which is a different set of bars from the
+	/// stream's — and comparing the two, which is the whole point of looking at
+	/// one person, would mean comparing bar 3 of one chart with bar 11 of the
+	/// other.
+	pub fn overlay(&self, offsets: &[Option<i64>]) -> Vec<usize> {
+		let mut counts = vec![0; self.counts.len()];
+		if counts.is_empty() {
+			return counts;
+		}
+		for offset in offsets.iter().flatten() {
+			let index = (offset - self.start_ms).max(0) / self.size_ms;
+			counts[(index as usize).min(self.counts.len() - 1)] += 1;
+		}
+		counts
+	}
+
 	/// A bucket's label. Whole seconds are noise on anything coarser than a
 	/// minute, and the only thing that distinguishes adjacent buckets below one.
 	pub fn label(&self, index: usize) -> String {
@@ -233,6 +275,36 @@ pub fn buckets(offsets: &[Option<i64>], size_ms: i64) -> Buckets {
 		size_ms,
 		counts,
 	}
+}
+
+/// Which chatter a `--author` argument names, as an index into
+/// [`Stats::authors`].
+///
+/// An exact handle or channel id wins outright, so `@bot` cannot be stolen by
+/// `@bottom` merely because that one is louder. Failing that a substring is
+/// enough, since handles are long and awkward to type — but only while it names
+/// one person, because picking the busiest of several matches would silently
+/// answer a different question than the one asked.
+pub fn find_author(authors: &[AuthorStat], query: &str) -> Result<usize, String> {
+	let query = query.trim();
+	let matches = |field: &str| field.eq_ignore_ascii_case(query);
+	if let Some(index) = authors.iter().position(|a| matches(&a.name) || matches(&a.key)) {
+		return Ok(index);
+	}
+
+	let needle = query.to_lowercase();
+	let mut found = authors
+		.iter()
+		.enumerate()
+		.filter(|(_, a)| a.name.to_lowercase().contains(&needle) || a.key.to_lowercase().contains(&needle));
+	let Some((index, _)) = found.next() else {
+		return Err(format!("no chatter here is called {query:?}"));
+	};
+	let ambiguous: Vec<&str> = std::iter::once(authors[index].name.as_str()).chain(found.map(|(_, a)| a.name.as_str())).take(6).collect();
+	if ambiguous.len() > 1 {
+		return Err(format!("{query:?} matches {} — try one of them", ambiguous.join(", ")));
+	}
+	Ok(index)
 }
 
 /// A bucket size for a span, off the ladder, aiming for [`TARGET_BUCKETS`].
@@ -411,6 +483,65 @@ mod tests {
 		assert_eq!(stats.money["£"].total, 5.0);
 		assert_eq!(stats.money["£"].top, Some(("@b".to_string(), 5.0)));
 		assert_eq!(stats.span_ms(), Some(30_000));
+	}
+
+	#[test]
+	fn keeps_each_chatters_own_messages_in_stream_time() {
+		let records = records(&[
+			r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"x","offset_ms":0}"#,
+			r#"{"kind":"text","author":"@b","author_channel_id":"UCb","badges":[],"text":"x","offset_ms":30000}"#,
+			r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"x","offset_ms":90000}"#,
+		]);
+		let stats = collect(&records, 0);
+		let a = &stats.authors[0];
+		assert_eq!(a.name, "@a");
+		assert_eq!(a.key, "UCa");
+		assert_eq!(a.offsets, vec![Some(0), Some(90_000)]);
+		assert_eq!(a.range(), Some((0, 90_000)));
+
+		// And they land on the stream's own grid, not one of their own: @a's
+		// second message is in bucket 3, where the chart draws it.
+		let buckets = buckets(&stats.offsets, 30_000);
+		assert_eq!(buckets.overlay(&a.offsets), vec![1, 0, 0, 1]);
+		assert_eq!(buckets.overlay(&stats.authors[1].offsets), vec![0, 1, 0, 0]);
+	}
+
+	#[test]
+	fn an_overlay_totals_the_chatters_own_messages_and_no_more() {
+		let stats = collect(
+			&records(&[
+				r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"x","offset_ms":0}"#,
+				r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"x"}"#,
+			]),
+			0,
+		);
+		let buckets = buckets(&stats.offsets, 30_000);
+		// The unplaced message is counted for them but has nowhere to be drawn,
+		// which is the same treatment the chart gives it.
+		assert_eq!(stats.authors[0].count, 2);
+		assert_eq!(buckets.overlay(&stats.authors[0].offsets).iter().sum::<usize>(), 1);
+	}
+
+	#[test]
+	fn names_a_chatter_by_handle_id_or_enough_of_either() {
+		let stats = collect(
+			&records(&[
+				r#"{"kind":"text","author":"@bottom","author_channel_id":"UCbottom","badges":[],"text":"x","offset_ms":0}"#,
+				r#"{"kind":"text","author":"@bottom","author_channel_id":"UCbottom","badges":[],"text":"x","offset_ms":1000}"#,
+				r#"{"kind":"text","author":"@bot","author_channel_id":"UCbot","badges":[],"text":"x","offset_ms":2000}"#,
+			]),
+			0,
+		);
+		let name = |i: usize| stats.authors[i].name.as_str();
+
+		assert_eq!(find_author(&stats.authors, "@bottom").map(name), Ok("@bottom"));
+		assert_eq!(find_author(&stats.authors, "UCbot").map(name), Ok("@bot"));
+		// An exact handle is not stolen by the busier chatter it is a prefix of.
+		assert_eq!(find_author(&stats.authors, "@BOT").map(name), Ok("@bot"));
+		// A substring that names one person is enough; one that names two is not.
+		assert_eq!(find_author(&stats.authors, "ttom").map(name), Ok("@bottom"));
+		assert!(find_author(&stats.authors, "bot").is_err());
+		assert!(find_author(&stats.authors, "@nobody").is_err());
 	}
 
 	#[test]

@@ -23,18 +23,19 @@ use app::App;
 /// changes under us — this only bounds how long a keypress waits.
 const TICK: Duration = Duration::from_millis(100);
 
-/// Runs the dashboard until it is quit.
-pub fn run(stats: &Stats, title: &str, bucket_ms: i64) -> Result<()> {
+/// Runs the dashboard until it is quit. `focus`, from `--author`, opens it with
+/// one chatter's distribution already drawn over the chart.
+pub fn run(stats: &Stats, title: &str, bucket_ms: i64, focus: Option<usize>) -> Result<()> {
 	let mut terminal = ratatui::init();
-	let result = event_loop(&mut terminal, stats, title, bucket_ms);
+	let result = event_loop(&mut terminal, stats, title, bucket_ms, focus);
 	// Unconditionally, so a failure inside the loop still hands the terminal
 	// back in the state it was borrowed in.
 	ratatui::restore();
 	result
 }
 
-fn event_loop(terminal: &mut ratatui::DefaultTerminal, stats: &Stats, title: &str, bucket_ms: i64) -> Result<()> {
-	let mut app = App::new(stats, title, bucket_ms);
+fn event_loop(terminal: &mut ratatui::DefaultTerminal, stats: &Stats, title: &str, bucket_ms: i64, focus: Option<usize>) -> Result<()> {
+	let mut app = App::focused(stats, title, bucket_ms, focus);
 	while !app.quit {
 		terminal.draw(|frame| panels::draw(frame, &mut app))?;
 		if event::poll(TICK)?
@@ -52,9 +53,9 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, stats: &Stats, title: &st
 /// to check in CI, over a pipe, or from anywhere without a terminal attached.
 /// Rendering through the same widget code into a fixed-size buffer gives
 /// something that can be read and diffed.
-pub fn snapshot(stats: &Stats, title: &str, bucket_ms: i64, cols: u16, rows: u16) -> Result<String> {
+pub fn snapshot(stats: &Stats, title: &str, bucket_ms: i64, focus: Option<usize>, cols: u16, rows: u16) -> Result<String> {
 	let mut terminal = Terminal::new(TestBackend::new(cols, rows))?;
-	let mut app = App::new(stats, title, bucket_ms);
+	let mut app = App::focused(stats, title, bucket_ms, focus);
 	terminal.draw(|frame| panels::draw(frame, &mut app))?;
 	Ok(buffer_text(terminal.backend()))
 }
@@ -108,7 +109,7 @@ mod tests {
 	#[test]
 	fn draws_every_panel() {
 		let stats = busy_stats();
-		let frame = snapshot(&stats, "livechat/x/chat.jsonl", 60_000, 120, 40).unwrap();
+		let frame = snapshot(&stats, "livechat/x/chat.jsonl", 60_000, None, 120, 40).unwrap();
 
 		assert!(frame.contains("Activity"));
 		assert!(frame.contains("Top chatters"));
@@ -129,7 +130,7 @@ mod tests {
 			r#"{"kind":"text","author":"@loud","author_channel_id":"UCa","badges":[],"text":"b","offset_ms":1000}"#,
 			r#"{"kind":"text","author":"@quiet","author_channel_id":"UCb","badges":[],"text":"c","offset_ms":2000}"#,
 		]);
-		let frame = snapshot(&stats, "chat.jsonl", 10_000, 120, 40).unwrap();
+		let frame = snapshot(&stats, "chat.jsonl", 10_000, None, 120, 40).unwrap();
 		let loud = frame.find("@loud").expect("the top chatter is listed");
 		let quiet = frame.find("@quiet").expect("the second chatter is listed");
 		assert!(loud < quiet, "the ranking is not in descending order");
@@ -138,7 +139,7 @@ mod tests {
 	#[test]
 	fn says_so_when_there_is_no_timeline() {
 		let stats = stats_from(&[r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"hello"}"#]);
-		let frame = snapshot(&stats, "chat.jsonl", 60_000, 120, 40).unwrap();
+		let frame = snapshot(&stats, "chat.jsonl", 60_000, None, 120, 40).unwrap();
 		assert!(frame.contains("no timeline"));
 		// Everything that does not need a clock still draws.
 		assert!(frame.contains("Top chatters"));
@@ -148,7 +149,7 @@ mod tests {
 	#[test]
 	fn leaves_out_the_rows_a_plain_chat_has_nothing_for() {
 		let stats = busy_stats();
-		let frame = snapshot(&stats, "chat.jsonl", 60_000, 120, 40).unwrap();
+		let frame = snapshot(&stats, "chat.jsonl", 60_000, None, 120, 40).unwrap();
 		// All one kind, no badges, no money — so none of those rows appear.
 		assert!(!frame.contains("Kinds"));
 		assert!(!frame.contains("Badges"));
@@ -163,7 +164,7 @@ mod tests {
 			r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":["Moderator"],"text":"hi","offset_ms":0}"#,
 			r#"{"kind":"superchat","author":"@b","author_channel_id":"UCb","badges":["Member (2 years)"],"text":"go on","amount":"£5.00","offset_ms":60000}"#,
 		]);
-		let frame = snapshot(&stats, "chat.jsonl", 30_000, 120, 40).unwrap();
+		let frame = snapshot(&stats, "chat.jsonl", 30_000, None, 120, 40).unwrap();
 		assert!(frame.contains("Kinds"));
 		assert!(frame.contains("Badges"));
 		assert!(frame.contains("Moderator"));
@@ -171,12 +172,30 @@ mod tests {
 	}
 
 	#[test]
+	fn draws_a_focused_chatter_over_the_chart() {
+		let stats = busy_stats();
+		let index = stats::find_author(&stats.authors, "@chatter4").expect("a chatter");
+		let frame = snapshot(&stats, "chat.jsonl", 60_000, Some(index), 120, 40).unwrap();
+
+		// The chart says whose line it is drawing, and at what height.
+		assert!(frame.contains("Activity — 1m buckets — @chatter4 peaks at "));
+		// The scrub bar says how many of the bucket under the cursor were theirs,
+		// which is the one thing a curve drawn to its own scale cannot show.
+		assert!(frame.contains("from @chatter4"), "the scrub bar does not say how many were theirs");
+
+		// And without a chatter named, the chart is the chat's alone.
+		let plain = snapshot(&stats, "chat.jsonl", 60_000, None, 120, 40).unwrap();
+		assert!(plain.contains("Activity — 1m buckets "));
+		assert!(!plain.contains("from @chatter4"));
+	}
+
+	#[test]
 	fn survives_a_terminal_too_small_to_hold_it() {
 		let stats = busy_stats();
 		// Every panel cannot fit; the point is that it clips rather than panics.
-		let frame = snapshot(&stats, "chat.jsonl", 60_000, 60, 20).unwrap();
+		let frame = snapshot(&stats, "chat.jsonl", 60_000, None, 60, 20).unwrap();
 		assert!(frame.contains("Activity"));
 		// And an absurd size is still only a drawing problem.
-		assert!(snapshot(&stats, "chat.jsonl", 60_000, 20, 6).is_ok());
+		assert!(snapshot(&stats, "chat.jsonl", 60_000, None, 20, 6).is_ok());
 	}
 }

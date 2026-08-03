@@ -6,11 +6,12 @@
 //! numbers are always available as flat text — no colour, no escape sequences,
 //! no cursor movement.
 
-use crate::stats::{Buckets, Stats};
+use crate::stats::{AuthorStat, Buckets, Stats};
 use crate::timeline;
 
-/// Writes the whole report.
-pub fn render(stats: &Stats, title: &str, buckets: &Buckets, top: usize, emoji: usize, width: usize) -> String {
+/// Writes the whole report. `focus` is an index into `stats.authors`, from
+/// `--author`, and adds that one chatter's own distribution to it.
+pub fn render(stats: &Stats, title: &str, buckets: &Buckets, top: usize, emoji: usize, width: usize, focus: Option<usize>) -> String {
 	let mut out = String::new();
 	out.push_str(&header(stats, title));
 
@@ -21,6 +22,9 @@ pub fn render(stats: &Stats, title: &str, buckets: &Buckets, top: usize, emoji: 
 		out.push_str(&activity(buckets, width));
 	} else {
 		out.push_str("\nActivity     no message carries a timestamp, so there is no timeline to place them on\n");
+	}
+	if let Some(author) = focus.and_then(|i| stats.authors.get(i)) {
+		out.push_str(&author_focus(stats, author, buckets, width));
 	}
 	out.push_str(&breakdown(stats, emoji));
 	out
@@ -67,6 +71,64 @@ fn activity(buckets: &Buckets, width: usize) -> String {
 		// and the shape is readable whatever the absolute numbers are.
 		let bar = count * width / peak;
 		out.push_str(&format!("  {:>label_width$}  {:<width$}  {:>7}\n", buckets.label(index), "#".repeat(bar), commas(*count)));
+	}
+	out
+}
+
+/// One chatter's messages across the stream, on the same buckets the activity
+/// chart used.
+///
+/// The bars are scaled to this chatter's own busiest bucket rather than the
+/// stream's: against a chat of twenty thousand messages, one person's evening is
+/// a flat line at zero, and the shape of when they were around is exactly what
+/// was asked for. The share column is what keeps that honest — it says how much
+/// of each bucket was theirs, so a tall bar in a quiet stretch cannot be
+/// mistaken for them dominating the chat.
+fn author_focus(stats: &Stats, author: &AuthorStat, buckets: &Buckets, width: usize) -> String {
+	let share = author.count as f64 / stats.messages.max(1) as f64 * 100.0;
+	let mut out = format!("\nAuthor       {}   {} messages   {share:.1}% of the chat\n", author.name, commas(author.count));
+	if author.key != author.name {
+		out.push_str(&format!("             {}\n", author.key));
+	}
+	if !author.badges.is_empty() {
+		out.push_str(&format!("             {}\n", author.badges.iter().cloned().collect::<Vec<_>>().join("   ")));
+	}
+	for (currency, total) in &author.money {
+		out.push_str(&format!("             paid {currency}{}\n", money(*total)));
+	}
+
+	if !stats.has_timeline() || buckets.counts.is_empty() {
+		return out;
+	}
+
+	let counts = buckets.overlay(&author.offsets);
+	let peak = counts.iter().copied().max().unwrap_or(0);
+	let peak_at = counts.iter().enumerate().max_by_key(|(_, c)| **c).map_or(0, |(i, _)| i);
+	if let Some((first, last)) = author.range() {
+		out.push_str(&format!(
+			"             first {}   last {}   busiest {} with {}\n",
+			timeline::stream_time(first),
+			timeline::stream_time(last),
+			buckets.label(peak_at),
+			commas(peak)
+		));
+	}
+
+	let label_width = (0..counts.len()).map(|i| buckets.label(i).chars().count()).max().unwrap_or(0);
+	for (index, count) in counts.iter().enumerate() {
+		let bar = count * width / peak.max(1);
+		// Blank rather than `0.0%` for a bucket they said nothing in: the gaps are
+		// half of what a distribution shows, and a column of zeroes hides them.
+		let share = match (count, buckets.counts[index]) {
+			(0, _) => String::new(),
+			(_, 0) => String::new(),
+			(count, total) => format!("{:>5.1}%", *count as f64 / total as f64 * 100.0),
+		};
+		let row = format!("  {:>label_width$}  {:<width$}  {:>7}  {share}", buckets.label(index), "#".repeat(bar), commas(*count));
+		// The share column is blank on a silent bucket, and a line of trailing
+		// spaces is something a diff notices and a reader cannot see.
+		out.push_str(row.trim_end());
+		out.push('\n');
 	}
 	out
 }
@@ -178,7 +240,7 @@ mod tests {
 			r#"{"kind":"text","author":"@b","author_channel_id":"UCb","badges":[],"text":"hi","sent_utc":"2026-07-26T22:15:40Z"}"#,
 		]);
 		let buckets = stats::buckets(&stats.offsets, 10_000);
-		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40);
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, None);
 
 		assert!(out.contains("2 messages   2 authors"));
 		assert!(out.contains("Top chatters"));
@@ -197,7 +259,7 @@ mod tests {
 			r#"{"kind":"superchat","author":"@b","author_channel_id":"UCb","badges":["Member (2 years)"],"text":"hi","amount":"£5.00","offset_ms":60000}"#,
 		]);
 		let buckets = stats::buckets(&stats.offsets, 30_000);
-		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40);
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, None);
 
 		assert!(out.contains("replay offsets"));
 		assert!(out.contains("Kinds"));
@@ -210,10 +272,53 @@ mod tests {
 	}
 
 	#[test]
+	fn a_focused_chatter_gets_their_own_distribution() {
+		let stats = stats_from(&[
+			r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":["Moderator"],"text":"one","offset_ms":0}"#,
+			r#"{"kind":"text","author":"@b","author_channel_id":"UCb","badges":[],"text":"two","offset_ms":30000}"#,
+			r#"{"kind":"text","author":"@b","author_channel_id":"UCb","badges":[],"text":"three","offset_ms":35000}"#,
+			r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"four","offset_ms":90000}"#,
+		]);
+		let buckets = stats::buckets(&stats.offsets, 30_000);
+		let focus = stats::find_author(&stats.authors, "@a").unwrap();
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, Some(focus));
+
+		assert!(out.contains("Author       @a   2 messages   50.0% of the chat"));
+		assert!(out.contains("UCa"));
+		assert!(out.contains("Moderator"));
+		assert!(out.contains("first 0:00:00   last 0:01:30"));
+		// Their bucket 1 is @b's alone, so it is a gap in their row rather than a
+		// bar, and the share says how much of each bucket was theirs.
+		let rows: Vec<&str> = out.lines().skip_while(|l| !l.starts_with("Author")).filter(|l| l.starts_with("  0:")).collect();
+		assert_eq!(rows.len(), 4, "one row per bucket of the stream, gaps included");
+		assert!(rows[0].ends_with("1  100.0%"));
+		assert!(rows[1].ends_with("0"), "a bucket they said nothing in gets no share: {:?}", rows[1]);
+		assert!(rows[3].ends_with("1  100.0%"));
+
+		// And without the flag, none of it appears.
+		let plain = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, None);
+		assert!(!plain.contains("Author"));
+	}
+
+	#[test]
+	fn a_focused_chatter_is_still_described_without_a_timeline() {
+		let stats = stats_from(&[
+			r#"{"kind":"superchat","author":"@a","author_channel_id":"UCa","badges":[],"text":"hi","amount":"£5.00"}"#,
+			r#"{"kind":"text","author":"@b","author_channel_id":"UCb","badges":[],"text":"hi"}"#,
+		]);
+		let buckets = stats::buckets(&stats.offsets, 30_000);
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, Some(0));
+		assert!(out.contains("Author       @a   1 messages   50.0% of the chat"));
+		assert!(out.contains("paid £5.00"));
+		// There is nothing to place them on, so nothing is drawn.
+		assert!(!out.contains("busiest"));
+	}
+
+	#[test]
 	fn says_so_when_there_is_no_timeline() {
 		let stats = stats_from(&[r#"{"kind":"text","author":"@a","author_channel_id":"UCa","badges":[],"text":"hello"}"#]);
 		let buckets = stats::buckets(&stats.offsets, 10_000);
-		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40);
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, None);
 		assert!(out.contains("no timeline"));
 		// Everything that does not need a clock is still reported.
 		assert!(out.contains("Top chatters"));
@@ -228,7 +333,7 @@ mod tests {
 		];
 		let stats = stats::collect(&records, 3);
 		let buckets = stats::buckets(&stats.offsets, 10_000);
-		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40);
+		let out = render(&stats, "chat.jsonl", &buckets, 20, 10, 40, None);
 		assert!(out.contains("3 lines could not be parsed"));
 		assert!(out.contains("1 amounts were in a shape this could not read"));
 	}

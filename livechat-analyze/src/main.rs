@@ -21,7 +21,7 @@ mod tui;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 
 #[derive(Parser)]
@@ -39,6 +39,12 @@ struct Args {
 	/// one that gives the stream about forty bars.
 	#[arg(long, value_name = "SPEC", default_value = "auto")]
 	bucket: String,
+
+	/// Single out one chatter: their handle or channel id, or enough of either to
+	/// name them on their own. Adds their own message distribution across the
+	/// stream to whichever way the report is rendered.
+	#[arg(long, value_name = "WHO")]
+	author: Option<String>,
 
 	/// How many emoji shortcodes to list.
 	#[arg(long, value_name = "N", default_value_t = 10)]
@@ -81,9 +87,17 @@ fn main() -> Result<()> {
 	let bucket = bucket.unwrap_or_else(|| stats.span_ms().map_or(60_000, stats::auto_bucket));
 	let title = path.display().to_string();
 
+	// Resolved here rather than inside each renderer: naming a chatter who is not
+	// in the file is a mistake worth stopping for, not one to report three
+	// different ways.
+	let focus = match &args.author {
+		Some(query) => Some(stats::find_author(&stats.authors, query).map_err(|why| anyhow!("{why}"))?),
+		None => None,
+	};
+
 	if let Some(size) = &args.snapshot {
 		let (cols, rows) = parse_size(size)?;
-		print!("{}", tui::snapshot(&stats, &title, bucket, cols, rows)?);
+		print!("{}", tui::snapshot(&stats, &title, bucket, focus, cols, rows)?);
 		return Ok(());
 	}
 
@@ -91,11 +105,11 @@ fn main() -> Result<()> {
 	// which a pipe wants.
 	if args.plain || !std::io::stdout().is_terminal() {
 		let buckets = stats::buckets(&stats.offsets, bucket);
-		print!("{}", report::render(&stats, &title, &buckets, args.top, args.emoji, args.width));
+		print!("{}", report::render(&stats, &title, &buckets, args.top, args.emoji, args.width, focus));
 		return Ok(());
 	}
 
-	tui::run(&stats, &title, bucket)
+	tui::run(&stats, &title, bucket, focus)
 }
 
 /// `120x40` -> `(120, 40)`.

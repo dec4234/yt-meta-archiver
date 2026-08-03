@@ -21,6 +21,9 @@ use crate::tui::app::App;
 /// reads as one thing rather than a page of boxes.
 const ACCENT: Color = Color::Cyan;
 const MUTED: Color = Color::DarkGray;
+/// The focused chatter, kept well away from [`ACCENT`] so the one person and the
+/// whole chat cannot be confused where the two lines run close together.
+const FOCUS: Color = Color::Magenta;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
 	let area = frame.area();
@@ -29,7 +32,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 	let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(3)]).split(area);
 	let columns = Layout::horizontal([Constraint::Percentage(62), Constraint::Percentage(38)]).split(rows[0]);
 	let left = Layout::vertical([Constraint::Min(0), Constraint::Length(8)]).split(columns[0]);
-	let right = Layout::vertical([Constraint::Min(0), Constraint::Length(3), Constraint::Length(7)]).split(columns[1]);
+	// Two rows for the keys: they no longer fit on one at any width this panel is
+	// given, and a key list cut off mid-word is a key nobody finds.
+	let right = Layout::vertical([Constraint::Min(0), Constraint::Length(4), Constraint::Length(7)]).split(columns[1]);
 
 	activity(frame, app, left[0]);
 	breakdown(frame, app.stats, left[1]);
@@ -41,9 +46,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 /// Message volume over the stream: the panel everything else is context for.
 fn activity(frame: &mut Frame, app: &App, area: Rect) {
-	let block = Block::bordered()
-		.title(format!(" Activity — {} buckets ", timeline::duration(app.bucket_ms)))
-		.border_style(Style::default().fg(MUTED));
+	let focused = app.focused_author();
+	// One chatter against a whole chat is a flat line at zero — a few hundred
+	// messages is a rounding error next to twenty thousand — so their curve is
+	// stretched to the chart's full height. That makes the height meaningless on
+	// its own, which is why the peak it was stretched from is in the title, where
+	// it is read whether or not the legend has room to draw itself.
+	let focus_counts = focused.map(|author| app.buckets.overlay(&author.offsets));
+	let focus_peak = focus_counts.iter().flatten().copied().max().unwrap_or(0);
+	let title = match focused {
+		Some(author) => format!(" Activity — {} buckets — {} peaks at {} ", timeline::duration(app.bucket_ms), author.name, commas(focus_peak)),
+		None => format!(" Activity — {} buckets ", timeline::duration(app.bucket_ms)),
+	};
+	let block = Block::bordered().title(title).border_style(Style::default().fg(MUTED));
 
 	if app.buckets.counts.is_empty() || !app.stats.has_timeline() {
 		let note = match app.stats.basis {
@@ -73,7 +88,15 @@ fn activity(frame: &mut Frame, app: &App, area: Rect) {
 	let first = app.buckets.start_ms as f64;
 	let last = app.buckets.start_of(app.buckets.counts.len().saturating_sub(1)) as f64 + app.buckets.size_ms as f64;
 
-	let datasets = vec![
+	let overlay: Vec<(f64, f64)> = match &focus_counts {
+		Some(counts) => {
+			let scale = peak / focus_peak.max(1) as f64;
+			counts.iter().enumerate().map(|(i, count)| (app.buckets.start_of(i) as f64 + half, *count as f64 * scale)).collect()
+		}
+		None => Vec::new(),
+	};
+
+	let mut datasets = vec![
 		// The cursor goes first so the volume is drawn over it rather than cut
 		// in half by it.
 		Dataset::default()
@@ -86,8 +109,25 @@ fn activity(frame: &mut Frame, app: &App, area: Rect) {
 			.marker(symbols::Marker::Braille)
 			.graph_type(GraphType::Area)
 			.fill_to_y(0.0)
-			.style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+			// Dimmed while someone is in focus: a solid fill at full strength is
+			// exactly the wrong backdrop for a thin line drawn across it.
+			.style(match focused {
+				Some(_) => Style::default().fg(ACCENT).add_modifier(Modifier::DIM),
+				None => Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+			}),
 	];
+	if let Some(author) = focused {
+		datasets.push(
+			// A line rather than another filled area: filled, it would bury the
+			// chat it is meant to be read against.
+			Dataset::default()
+				.name(author.name.clone())
+				.data(&overlay)
+				.marker(symbols::Marker::Braille)
+				.graph_type(GraphType::Line)
+				.style(Style::default().fg(FOCUS).add_modifier(Modifier::BOLD)),
+		);
+	}
 
 	let x_labels = vec![
 		Span::raw(timeline::stream_time(app.buckets.start_ms)),
@@ -139,7 +179,13 @@ fn chatters(frame: &mut Frame, app: &mut App, area: Rect) {
 		Constraint::Length(6),
 		Constraint::Length(bar_width as u16),
 	];
-	let table = Table::new(rows, widths).block(block).row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+	// The selected row turns the overlay's colour while the overlay is up, which
+	// is what ties the magenta line on the chart to a name over here.
+	let highlight = match app.focus {
+		true => Style::default().fg(FOCUS).add_modifier(Modifier::REVERSED),
+		false => Style::default().add_modifier(Modifier::REVERSED),
+	};
+	let table = Table::new(rows, widths).block(block).row_highlight_style(highlight);
 	frame.render_stateful_widget(table, area, &mut app.table);
 }
 
@@ -213,11 +259,18 @@ fn controls(frame: &mut Frame, area: Rect) {
 		Span::raw(" rank "),
 		Span::styled("p", key),
 		Span::raw(" peak "),
+		Span::styled("f", key),
+		Span::raw(" focus "),
 		Span::styled("q", key),
 		Span::raw(" quit"),
 	]);
 	let block = Block::bordered().title(" Controls ").border_style(Style::default().fg(MUTED));
-	frame.render_widget(Paragraph::new(keys).block(block), area);
+	frame.render_widget(
+		Paragraph::new(keys).block(block).wrap(Wrap {
+			trim: true,
+		}),
+		area,
+	);
 }
 
 fn status(frame: &mut Frame, app: &App, area: Rect) {
@@ -263,7 +316,16 @@ fn scrub(frame: &mut Frame, app: &App, area: Rect) {
 		let from = timeline::stream_time(app.buckets.start_of(app.scrub));
 		let to = timeline::stream_time(app.buckets.start_of(app.scrub) + app.buckets.size_ms);
 		let last = app.buckets.counts.len().saturating_sub(1).max(1) as f64;
-		(format!(" {from} – {to}   {} messages ", commas(count)), app.scrub as f64 / last)
+		// The overlay is drawn to its own scale, so the one number it cannot show
+		// is how many of these messages were actually theirs. Here it is.
+		let mine = match app.focused_author() {
+			Some(author) => {
+				let mine = app.buckets.overlay(&author.offsets)[app.scrub];
+				format!("   {} from {} ", commas(mine), author.name)
+			}
+			None => " ".to_string(),
+		};
+		(format!(" {from} – {to}   {} messages{mine}", commas(count)), app.scrub as f64 / last)
 	};
 
 	// Drawn from two different characters rather than one in two colours, so the
