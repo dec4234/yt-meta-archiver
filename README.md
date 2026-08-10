@@ -6,6 +6,38 @@ ongoing livestreams and VODs.
 A lot of this was AI generated, use at your own risk. You may be subject to rate limiting or restrictions from YouTube
 if you hit the site too much.
 
+## Setup
+
+`posts`, `comments` and a live `livechat` use a real browser, so you must install one before you run them. Install
+Google Chrome, Chromium or Microsoft Edge. Edge is sufficient, because it speaks the same DevTools protocol. Only a
+`livechat` replay and `livechat-analyze` do not need a browser.
+
+The tool starts the browser itself in headless mode. Do not start a browser first, and do not install a driver such as
+chromedriver.
+
+The tool looks for the browser in this sequence:
+
+1. The path in the `CHROME_PATH` environment variable.
+2. Chrome in `%ProgramFiles%`, `%ProgramFiles(x86)%` or `%LOCALAPPDATA%` (Windows).
+3. Edge in `%ProgramFiles%` or `%ProgramFiles(x86)%` (Windows).
+4. `/usr/bin/google-chrome` or `/usr/bin/chromium` (Linux).
+5. `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome` (macOS).
+
+If your browser is in a different location, or if the run stops with `no Chrome/Chromium/Edge binary found`, set
+`CHROME_PATH` to the browser program:
+
+```
+# Windows (PowerShell)
+$env:CHROME_PATH = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+# Linux / macOS
+export CHROME_PATH=/usr/bin/chromium
+```
+
+The browser runs with a new, empty profile on each run. Thus you are not signed in to YouTube, and you get only the
+public data. Each run also opens its own browser: if you run more than one command at the same time, each command uses
+more memory and more CPU.
+
 ## Community posts
 
 ```
