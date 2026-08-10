@@ -3,6 +3,9 @@
 Archive tool for community posts, and comments on videos, community posts, and shorts. Also archive live chat from
 ongoing livestreams and VODs.
 
+A lot of this was AI generated, use at your own risk. You may be subject to rate limiting or restrictions from YouTube
+if you hit the site too much.
+
 ## Community posts
 
 ```
@@ -45,6 +48,16 @@ Not every VOD keeps a replay.
 
 The run continues until the chat closes or you stop it, and restarts the browser by itself if it dies. The transcript is
 appended to and deduplicated by message id, so you can re-run over the same directory to add what is missing.
+
+## Reading a chat back
+
+```
+livechat-analyze <path> [--top n] [--bucket spec] [--author who] [--plain]
+```
+
+`livechat-analyze` is a second binary in this workspace. It reads a `chat.jsonl` transcript back and says who talked,
+how much, and when across the stream on a terminal, or as flat text through a pipe. See
+[livechat-analyze/README.md](livechat-analyze/README.md).
 
 ## Other flags
 
