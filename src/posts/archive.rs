@@ -18,6 +18,7 @@ use super::comments::{self, Target};
 use super::details::{self, Details};
 use crate::browser::ImageFormat;
 use crate::clip::Clipper;
+use crate::profile_picture::ProfilePictures;
 use crate::{browser, time};
 
 const ARCHIVER_JS: &str = include_str!("js/archiver.js");
@@ -55,7 +56,7 @@ struct Progress {
 }
 
 /// How a run is to be carried out, beyond where its output goes.
-pub(super) struct Options {
+pub(super) struct Options<'a> {
 	/// Stop after this many posts; used to sample a channel quickly.
 	pub limit: Option<usize>,
 	/// Look up each post's exact date and text, which costs a page fetch per
@@ -72,6 +73,9 @@ pub(super) struct Options {
 	pub workers: usize,
 	/// What the screenshots are encoded as.
 	pub format: ImageFormat,
+	/// Where the channel's and each commenter's profile picture goes, when they
+	/// are wanted.
+	pub pictures: Option<&'a ProfilePictures>,
 }
 
 /// Captures every post on the channel, restarting the browser between batches
@@ -80,6 +84,9 @@ pub(super) struct Options {
 pub(super) fn archive(posts_url: &str, out_dir: &Path, opts: &Options) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 	let (limit, workers) = (opts.limit, opts.workers);
+
+	// The channel wrote every post, so its picture is had once, up front.
+	let channel_picture = opts.pictures.map(|pictures| pictures.for_channel_url(posts_url));
 
 	let mut next = 0;
 	// Keys are zero-padded, so the map serialises in capture order.
@@ -100,11 +107,18 @@ pub(super) fn archive(posts_url: &str, out_dir: &Path, opts: &Options) -> Result
 				format: opts.format,
 			};
 			attach_comments(&mut entries, &round.captures, out_dir, wanted, workers);
+			if let Some(pictures) = opts.pictures {
+				for (_, entry) in &mut entries {
+					if let Some(Value::Array(comments)) = entry.get_mut("comments") {
+						pictures.attach_to_comments(comments);
+					}
+				}
+			}
 		}
 		index.extend(entries);
 		// Rewritten after every round, so an interrupted run still leaves a
 		// usable index for the screenshots on disk.
-		write_index(out_dir, posts_url, opts, &index)?;
+		write_index(out_dir, posts_url, opts, channel_picture.as_ref(), &index)?;
 
 		if round.end_of_feed || limit.is_some_and(|l| round.next >= l) {
 			return Ok(index.len());
@@ -260,9 +274,11 @@ fn attach_comments(entries: &mut [(String, Value)], captures: &[Capture], out_di
 	}
 }
 
-fn write_index(out_dir: &Path, posts_url: &str, opts: &Options, index: &serde_json::Map<String, Value>) -> Result<()> {
+/// `channel_picture` is `None` when pictures were not asked for, which leaves
+/// the field out, and `Some(None)` when the channel's could not be had.
+fn write_index(out_dir: &Path, posts_url: &str, opts: &Options, channel_picture: Option<&Option<String>>, index: &serde_json::Map<String, Value>) -> Result<()> {
 	let path = out_dir.join(INDEX_FILE);
-	let doc = serde_json::json!({
+	let mut doc = serde_json::json!({
 		"channel": posts_url,
 		"captured_at": time::now_utc(),
 		// What the nested comment lists were filtered by, so an index with few
@@ -272,6 +288,9 @@ fn write_index(out_dir: &Path, posts_url: &str, opts: &Options, index: &serde_js
 		"comment_subcomments": opts.comments.map(|_| opts.subcomments),
 		"posts": index,
 	});
+	if let Some(picture) = channel_picture {
+		doc["channel_profile_picture"] = picture.clone().into();
+	}
 	debug!("writing index with {} entries to {}", index.len(), path.display());
 	std::fs::write(&path, serde_json::to_string_pretty(&doc)?).with_context(|| format!("writing {}", path.display()))
 }

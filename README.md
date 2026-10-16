@@ -41,7 +41,7 @@ more memory and more CPU.
 ## Community posts
 
 ```
-yt-meta-archiver posts <channel> [--max n] [--details] [--comments [--min-likes n] [--subcomments n]] [--compress [quality]] [--mt [workers]] [--out <dir>]
+yt-meta-archiver posts <channel> [--max n] [--details] [--comments [--min-likes n] [--subcomments n]] [--compress [quality]] [--mt [workers]] [--grab-profile-picture [dir]] [--out <dir>]
 ```
 
 Screenshots every community post and writes a `posts.json` index. `--details` adds each post's date and text.
@@ -51,7 +51,7 @@ so all three are off by default.
 ## Video comments
 
 ```
-yt-meta-archiver comments <video> [--min-likes n] [--max n] [--subcomments n] [--pic] [--compress [quality]] [--out <dir>]
+yt-meta-archiver comments <video> [--min-likes n] [--max n] [--subcomments n] [--pic] [--compress [quality]] [--grab-profile-picture [dir]] [--out <dir>]
 ```
 
 Writes the comments of one video to `<out>/<video id>/comments.json`. `<video>` is a watch, `youtu.be`, `/live` or
@@ -65,7 +65,7 @@ Writes the comments of one video to `<out>/<video id>/comments.json`. `<video>` 
 ## Live chat
 
 ```
-yt-meta-archiver livechat <stream> [--pic] [--compress [quality]] [--out <dir>]
+yt-meta-archiver livechat <stream> [--pic] [--compress [quality]] [--grab-profile-picture [dir]] [--out <dir>]
 ```
 
 Follows a livestream's chat and appends each message to `<out>/<video id>/chat.jsonl`, one JSON object per line.
@@ -95,4 +95,8 @@ how much, and when across the stream on a terminal, or as flat text through a pi
 
 - `--compress` writes WebP instead of the default lossless PNG, at the quality given (1-100, 80 for a bare flag). On
   `livechat` and `comments` it needs `--pic`.
+- `--grab-profile-picture` saves the profile picture of each author into one shared directory (`profile-pictures` for
+  a bare flag). Each entry gets a `profile_picture` path. All subcommands and all runs use the same directory, and a
+  picture that is already there is used again, not downloaded again. On `posts` it saves the channel picture, plus each
+  commenter's picture with `--comments`.
 - `-v` (repeatable) increases the log detail. It applies to any subcommand.

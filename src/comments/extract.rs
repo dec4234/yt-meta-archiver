@@ -22,6 +22,7 @@ use super::meta::{self, Meta};
 use super::replies;
 use crate::browser::ImageFormat;
 use crate::clip::Clipper;
+use crate::profile_picture::ProfilePictures;
 use crate::{browser, time, video};
 
 /// Sidecar index written next to the screenshots.
@@ -38,7 +39,7 @@ const WARMUP_ROUNDS: u32 = 20;
 const MAX_SCROLLS: u32 = 500;
 
 /// How a run is to be carried out, beyond which video it is about.
-pub(super) struct Options {
+pub(super) struct Options<'a> {
 	/// Keep only comments with at least this many likes.
 	pub min_likes: u64,
 	/// Stop after this many kept comments.
@@ -50,6 +51,8 @@ pub(super) struct Options {
 	pub pics: bool,
 	/// What those screenshots are encoded as.
 	pub format: ImageFormat,
+	/// Where each author's profile picture goes, when they are wanted.
+	pub pictures: Option<&'a ProfilePictures>,
 }
 
 /// Reads the video's comments, writes `comments.json` (and, with `pics`, a
@@ -112,7 +115,10 @@ pub(super) fn extract(video_id: &str, out_dir: &Path, opts: &Options) -> Result<
 		wanted.truncate(max);
 	}
 
-	let entries = collect(&clipper, &metas, &wanted, video_id, out_dir, opts);
+	let mut entries = collect(&clipper, &metas, &wanted, video_id, out_dir, opts);
+	if let Some(pictures) = opts.pictures {
+		pictures.attach_to_comments(&mut entries);
+	}
 	write_index(out_dir, video_id, title.as_deref(), opts, loaded, &entries)?;
 	Ok(entries.len())
 }

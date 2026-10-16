@@ -70,3 +70,15 @@ fn init_logging(verbosity: u8) -> Result<()> {
 		.init()?;
 	Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+	use clap::CommandFactory;
+
+	use super::*;
+
+	#[test]
+	fn the_command_line_is_well_formed() {
+		Cli::command().debug_assert();
+	}
+}

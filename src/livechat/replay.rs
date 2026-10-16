@@ -27,6 +27,7 @@ use log::{debug, info, trace, warn};
 use serde_json::{Value, json};
 
 use super::watch::{self, TRANSCRIPT_FILE};
+use crate::profile_picture::ProfilePictures;
 use crate::{http, video};
 
 /// The endpoint the replay chat paginates through. Its `key` is the public
@@ -121,7 +122,7 @@ pub(super) fn probe(video_id: &str) -> Result<Chat> {
 /// Like the live path this appends and deduplicates rather than truncating, so a
 /// replay run over a directory that already holds a partial live capture fills
 /// in what was missed instead of throwing away what was caught.
-pub(super) fn archive(replay: &Replay, out_dir: &Path) -> Result<usize> {
+pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&ProfilePictures>) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 	let path = out_dir.join(TRANSCRIPT_FILE);
 
@@ -165,6 +166,7 @@ pub(super) fn archive(replay: &Replay, out_dir: &Path) -> Result<usize> {
 			// What a replay has and a live capture cannot: where in the stream
 			// the message was said.
 			entry["offset_ms"] = at_ms.into();
+			watch::attach_picture(&mut entry, &message, pictures);
 			writeln!(transcript, "{}", serde_json::to_string(&entry)?).context("writing the transcript")?;
 			written += 1;
 			trace!("[{}] {} {}", already + written, stream_time(at_ms), watch::summarise(&entry));
@@ -245,6 +247,9 @@ fn describe(item: &Value) -> Option<Value> {
 		"kind": kind,
 		"author": author,
 		"author_channel_id": renderer["authorExternalChannelId"].as_str(),
+		// Not written to the transcript; it is where the profile picture comes
+		// from, when one is wanted.
+		"author_photo": renderer["authorPhoto"]["thumbnails"].as_array().and_then(|t| t.last()).and_then(|t| t["url"].as_str()),
 		"badges": badges(&renderer),
 		// Absent on a sticker and on a gift purchase, which say everything they
 		// have to say in `kind`, `amount` and `header`.

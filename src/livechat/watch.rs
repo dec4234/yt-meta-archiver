@@ -21,6 +21,7 @@ use serde_json::Value;
 
 use super::source::Stream;
 use crate::browser::ImageFormat;
+use crate::profile_picture::ProfilePictures;
 use crate::{browser, time};
 
 const LIVECHAT_JS: &str = include_str!("js/livechat.js");
@@ -64,7 +65,7 @@ const CAPTURE_ATTEMPTS: u32 = 3;
 
 /// Watches `stream`'s chat until the process is interrupted or the chat closes,
 /// appending to the transcript as it goes. Returns how many messages it wrote.
-pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat) -> Result<usize> {
+pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat, pictures: Option<&ProfilePictures>) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let path = out_dir.join(TRANSCRIPT_FILE);
@@ -77,6 +78,7 @@ pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFo
 		transcript: BufWriter::new(file),
 		pics,
 		format,
+		pictures,
 		written: 0,
 		recorded: HashSet::new(),
 	};
@@ -92,20 +94,22 @@ enum Ended {
 	BrowserLost,
 }
 
-struct Watcher {
+struct Watcher<'a> {
 	out_dir: PathBuf,
 	transcript: BufWriter<File>,
 	/// Screenshot each message as well as recording it.
 	pics: bool,
 	/// What those screenshots are encoded as.
 	format: ImageFormat,
+	/// Where each author's profile picture goes, when they are wanted.
+	pictures: Option<&'a ProfilePictures>,
 	written: usize,
 	/// Ids already in the transcript, so a reconnect that re-reads part of the
 	/// page cannot write a message twice.
 	recorded: HashSet<String>,
 }
 
-impl Watcher {
+impl Watcher<'_> {
 	/// Watches until the chat closes, reconnecting when the browser dies. A
 	/// stream runs for hours and the browser does not always last that long, so
 	/// losing it is treated as something to recover from rather than the end of
@@ -302,7 +306,11 @@ impl Watcher {
 			None
 		};
 
-		let entry = entry(message, self.written, pic.as_deref());
+		let mut entry = entry(message, self.written, pic.as_deref());
+		// After the screenshot, which is the one that cannot wait: the message
+		// is only on screen for so long, and its author's picture is not going
+		// anywhere.
+		attach_picture(&mut entry, message, self.pictures);
 		writeln!(self.transcript, "{}", serde_json::to_string(&entry)?).context("writing the transcript")?;
 		self.transcript.flush().context("flushing the transcript")?;
 		self.written += 1;
@@ -442,6 +450,16 @@ pub(super) fn entry(message: &Value, seq: usize, pic: Option<&str>) -> Value {
 		entry.insert("pic".to_string(), pic.into());
 	}
 	Value::Object(entry)
+}
+
+/// Adds `profile_picture` to a transcript line when pictures were asked for,
+/// by the author's channel id; `null` when there is no id or no picture.
+pub(super) fn attach_picture(entry: &mut Value, message: &Value, pictures: Option<&ProfilePictures>) {
+	let Some(pictures) = pictures else {
+		return;
+	};
+	let picture = message["author_channel_id"].as_str().and_then(|id| pictures.for_channel_id(id, message["author_photo"].as_str()));
+	entry["profile_picture"] = picture.into();
 }
 
 /// YouTube's own send time, converted from microseconds since the epoch.

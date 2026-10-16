@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use log::{info, warn};
 
-use crate::{browser, video};
+use crate::{browser, profile_picture, video};
 
 const DEFAULT_OUT_DIR: &str = "livechat";
 
@@ -47,12 +47,16 @@ pub struct Args {
 	/// Transcript and screenshots are written to <OUTPUT_DIR>/<video id>
 	#[arg(long, value_name = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
 	out: PathBuf,
+
+	#[command(flatten)]
+	profile_pictures: profile_picture::Args,
 }
 
 pub fn run(args: &Args) -> Result<()> {
 	let stream = source::resolve(&args.stream)?;
 	let out_dir = args.out.join(&stream.video_id);
 	let transcript = out_dir.join(watch::TRANSCRIPT_FILE);
+	let pictures = args.profile_pictures.open()?;
 
 	info!("stream:  {}", video::watch_url(&stream.video_id));
 	if let Some(title) = &stream.title {
@@ -76,7 +80,7 @@ pub fn run(args: &Args) -> Result<()> {
 			if args.pic {
 				warn!("--pic wants a rendered chat and a replay has none, so this run is the transcript only");
 			}
-			replay::archive(&replay, &out_dir)?
+			replay::archive(&replay, &out_dir, pictures.as_ref())?
 		}
 		replay::Chat::Live | replay::Chat::Unknown => {
 			let format = browser::ImageFormat::from_arg(args.compress);
@@ -87,10 +91,13 @@ pub fn run(args: &Args) -> Result<()> {
 				}
 			}
 			info!("following the chat — interrupt with Ctrl-C to stop");
-			watch::watch(&stream, &out_dir, args.pic, format)?
+			watch::watch(&stream, &out_dir, args.pic, format, pictures.as_ref())?
 		}
 	};
 
 	info!("wrote {written} messages to {}", transcript.display());
+	if let Some(pictures) = &pictures {
+		pictures.report();
+	}
 	Ok(())
 }

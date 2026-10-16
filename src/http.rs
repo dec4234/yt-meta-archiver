@@ -31,6 +31,18 @@ pub fn get_html(url: &str) -> Result<String> {
 	Ok(html)
 }
 
+/// Fetches `url` as raw bytes, along with the content type the server gave it,
+/// for the images we keep rather than parse.
+pub fn get_bytes(url: &str) -> Result<(Vec<u8>, Option<String>)> {
+	trace!("fetching {url}");
+	let mut response = ureq::get(url).header("user-agent", USER_AGENT).call()?;
+	let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
+	let bytes = response.body_mut().with_config().limit(MAX_PAGE_BYTES).read_to_vec()?;
+
+	trace!("read {} bytes from {url}", bytes.len());
+	Ok((bytes, content_type))
+}
+
 /// Posts `body` as JSON and reads the JSON back. This is how YouTube's own
 /// pages talk to their backend once they have loaded, so the endpoints that
 /// paginate — live chat replay among them — are reachable without a browser.

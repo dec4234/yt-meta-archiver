@@ -81,9 +81,17 @@
             meta.set(node.id, {
                 timestamp_usec: node.timestampUsec,
                 author_channel_id: node.authorExternalChannelId || null,
+                author_photo: photoUrl(node.authorPhoto),
             });
         }
         for (const k in node) harvest(node[k], depth + 1);
+    }
+
+    // The largest of a `{thumbnails: [{url}]}` image's sizes.
+    function photoUrl(image) {
+        const thumbs = image && Array.isArray(image.thumbnails) ? image.thumbnails : [];
+        const last = thumbs[thumbs.length - 1];
+        return last && typeof last.url === "string" ? last.url : null;
     }
 
     // Counters for how the hook is faring, reported by `state` so a -vv run can
@@ -158,6 +166,12 @@
         return out.trim() || null;
     }
 
+    function attr(el, selector, name) {
+        const node = el.querySelector(selector);
+        const value = node ? node.getAttribute(name) : null;
+        return value && value.startsWith("http") ? value : null;
+    }
+
     function text(el, selector) {
         const node = el.querySelector(selector);
         return node ? node.textContent.trim() || null : null;
@@ -177,6 +191,9 @@
             kind: KINDS[el.tagName] || "other",
             author: text(el, "#author-name"),
             author_channel_id: data.author_channel_id || null,
+            // From the response where we saw one, else whatever the rendered
+            // avatar has loaded.
+            author_photo: data.author_photo || attr(el, "#author-photo img", "src"),
             badges: badges(el),
             // Absent on a sticker or a bare membership announcement, which say
             // everything they have to say in `kind` and `amount`.

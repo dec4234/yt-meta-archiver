@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use log::info;
 
-use crate::{browser, cli};
+use crate::{browser, cli, profile_picture};
 
 const DEFAULT_CHANNEL: &str = "https://www.youtube.com/@DanielLarson-ob2jw/posts";
 const DEFAULT_OUT_DIR: &str = "screenshots";
@@ -64,6 +64,11 @@ pub struct Args {
 	/// Screenshots are written to <OUTPUT_DIR>/<handle>
 	#[arg(long, value_name = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
 	out: PathBuf,
+
+	/// With --comments, every commenter's picture is saved as well as the
+	/// channel's own.
+	#[command(flatten)]
+	profile_pictures: profile_picture::Args,
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -71,6 +76,7 @@ pub fn run(args: &Args) -> Result<()> {
 	let out_dir = out_dir_for(&url, &args.out);
 	let workers = args.mt.map_or(1, cli::worker_count);
 	let format = browser::ImageFormat::from_arg(args.compress);
+	let pictures = args.profile_pictures.open()?;
 	info!("channel: {url}");
 	info!("output:  {}", out_dir.display());
 	if !args.details {
@@ -101,8 +107,12 @@ pub fn run(args: &Args) -> Result<()> {
 		subcomments: args.subcomments,
 		workers,
 		format,
+		pictures: pictures.as_ref(),
 	};
 	let written = archive::archive(&url, &out_dir, &opts)?;
+	if let Some(pictures) = &pictures {
+		pictures.report();
+	}
 	info!("wrote {written} screenshots to {}", out_dir.display());
 	info!("index:   {}", out_dir.join(archive::INDEX_FILE).display());
 	Ok(())

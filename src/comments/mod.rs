@@ -15,7 +15,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use log::info;
 
-use crate::{browser, video};
+use crate::{browser, profile_picture, video};
 
 /// The script injected into any page whose comments we are reading, shared with
 /// the posts extractor.
@@ -61,12 +61,16 @@ pub struct Args {
 	/// Index and screenshots are written to <OUTPUT_DIR>/<video id>
 	#[arg(long, value_name = "OUTPUT_DIR", default_value = DEFAULT_OUT_DIR)]
 	out: PathBuf,
+
+	#[command(flatten)]
+	profile_pictures: profile_picture::Args,
 }
 
 pub fn run(args: &Args) -> Result<()> {
 	let video_id = video::resolve_id(&args.video)?;
 	let out_dir = args.out.join(&video_id);
 	let format = browser::ImageFormat::from_arg(args.compress);
+	let pictures = args.profile_pictures.open()?;
 
 	info!("video:   {}", video::watch_url(&video_id));
 	info!("output:  {}", out_dir.display());
@@ -95,8 +99,12 @@ pub fn run(args: &Args) -> Result<()> {
 		subcomments: args.subcomments,
 		pics: args.pic,
 		format,
+		pictures: pictures.as_ref(),
 	};
 	let written = extract::extract(&video_id, &out_dir, &opts)?;
+	if let Some(pictures) = &pictures {
+		pictures.report();
+	}
 	info!("wrote {written} comments to {}", out_dir.join(extract::INDEX_FILE).display());
 	Ok(())
 }
