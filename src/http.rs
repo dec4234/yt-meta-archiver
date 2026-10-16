@@ -14,6 +14,10 @@ const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 /// runaway response.
 const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
 
+/// An original channel banner can be a 2560x1440 PNG of several megabytes;
+/// this, again, only guards against a runaway response.
+const MAX_IMAGE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Fetches `url` as English-language HTML, posing as a desktop browser —
 /// YouTube serves a different page to anything that looks like a script.
 pub fn get_html(url: &str) -> Result<String> {
@@ -37,7 +41,7 @@ pub fn get_bytes(url: &str) -> Result<(Vec<u8>, Option<String>)> {
 	trace!("fetching {url}");
 	let mut response = ureq::get(url).header("user-agent", USER_AGENT).call()?;
 	let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(str::to_string);
-	let bytes = response.body_mut().with_config().limit(MAX_PAGE_BYTES).read_to_vec()?;
+	let bytes = response.body_mut().with_config().limit(MAX_IMAGE_BYTES).read_to_vec()?;
 
 	trace!("read {} bytes from {url}", bytes.len());
 	Ok((bytes, content_type))

@@ -81,6 +81,36 @@ Not every VOD keeps a replay.
 The run continues until the chat closes or you stop it, and restarts the browser by itself if it dies. The transcript is
 appended to and deduplicated by message id, so you can re-run over the same directory to add what is missing.
 
+## Profile pictures
+
+```
+yt-meta-archiver pfp <channel>... [--from <file>] [--size pixels] [--refresh] [--mt [workers]] [--out <dir>]
+```
+
+Saves the profile picture of each channel to `<out>` (`profile-pictures` by default). This is the same shared directory
+that `--grab-profile-picture` uses, so the two use the pictures of each other. `<channel>` is a handle (`@name`), a
+channel id (`UC…`), or a channel URL. `pfp` does not need a browser.
+
+- `--from` also reads channels from a file, one on each line. The tool skips blank lines and lines that start with `#`.
+- `--size` sets the size of the square picture in pixels (16-900, 176 by default).
+- `--refresh` downloads each picture again, also when it is already in the directory.
+
+The tool writes one line to stdout for each channel: the input and the saved path, with a tab between them. If one or
+more channels have no picture, the exit code is not zero.
+
+## Channel banners
+
+```
+yt-meta-archiver banner <channel>... [--from <file>] [--cropped] [--refresh] [--mt [workers]] [--out <dir>]
+```
+
+Saves the banner (header image) of each channel to `<out>` (`banners` by default). The file names are the same as in
+`pfp`. `banner` takes the same channel input, `--from`, `--refresh` and `--mt` as `pfp`, and gives the same stdout lines
+and exit code. It does not need a browser.
+
+By default, the tool keeps the original upload with no crop. `--cropped` keeps the wide strip that a desktop browser
+shows.
+
 ## Reading a chat back
 
 ```

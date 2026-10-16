@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use log::LevelFilter;
 use simple_logger::SimpleLogger;
 
-use crate::{comments, livechat, posts};
+use crate::{banner, comments, livechat, pfp, posts};
 
 #[derive(Parser)]
 #[command(version, about = "Archives what a YouTube channel has published.")]
@@ -29,6 +29,13 @@ enum Command {
 
 	/// Index a video's comments, optionally screenshotting them.
 	Comments(comments::Args),
+
+	/// Save the profile pictures of one or more channels.
+	#[command(visible_alias = "profile-pictures")]
+	Pfp(pfp::Args),
+
+	/// Save the banners of one or more channels.
+	Banner(banner::Args),
 }
 
 /// Parses the command line and runs whichever extractor it names.
@@ -39,6 +46,8 @@ pub fn run() -> Result<()> {
 		Command::Posts(args) => posts::run(args),
 		Command::Livechat(args) => livechat::run(args),
 		Command::Comments(args) => comments::run(args),
+		Command::Pfp(args) => pfp::run(args),
+		Command::Banner(args) => banner::run(args),
 	}
 }
 
