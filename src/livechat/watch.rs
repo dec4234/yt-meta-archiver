@@ -21,8 +21,9 @@ use serde_json::Value;
 
 use super::source::Stream;
 use crate::browser::ImageFormat;
+use crate::image_store::ImageStore;
 use crate::profile_picture::ProfilePictures;
-use crate::{browser, time};
+use crate::{browser, emoji, time};
 
 const LIVECHAT_JS: &str = include_str!("js/livechat.js");
 
@@ -65,7 +66,7 @@ const CAPTURE_ATTEMPTS: u32 = 3;
 
 /// Watches `stream`'s chat until the process is interrupted or the chat closes,
 /// appending to the transcript as it goes. Returns how many messages it wrote.
-pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat, pictures: Option<&ProfilePictures>) -> Result<usize> {
+pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFormat, pictures: Option<&ProfilePictures>, emojis: Option<&ImageStore>) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 
 	let path = out_dir.join(TRANSCRIPT_FILE);
@@ -79,6 +80,7 @@ pub(super) fn watch(stream: &Stream, out_dir: &Path, pics: bool, format: ImageFo
 		pics,
 		format,
 		pictures,
+		emojis,
 		written: 0,
 		recorded: HashSet::new(),
 	};
@@ -103,6 +105,8 @@ struct Watcher<'a> {
 	format: ImageFormat,
 	/// Where each author's profile picture goes, when they are wanted.
 	pictures: Option<&'a ProfilePictures>,
+	/// Where the images of custom emoji go, when they are wanted.
+	emojis: Option<&'a ImageStore>,
 	written: usize,
 	/// Ids already in the transcript, so a reconnect that re-reads part of the
 	/// page cannot write a message twice.
@@ -311,6 +315,7 @@ impl Watcher<'_> {
 		// is only on screen for so long, and its author's picture is not going
 		// anywhere.
 		attach_picture(&mut entry, message, self.pictures);
+		emoji::attach_images(&mut entry, self.emojis);
 		writeln!(self.transcript, "{}", serde_json::to_string(&entry)?).context("writing the transcript")?;
 		self.transcript.flush().context("flushing the transcript")?;
 		self.written += 1;
@@ -445,6 +450,9 @@ pub(super) fn entry(message: &Value, seq: usize, pic: Option<&str>) -> Value {
 		if !message[field].is_null() {
 			entry.insert(field.to_string(), message[field].clone());
 		}
+	}
+	if message["emojis"].as_array().is_some_and(|emojis| !emojis.is_empty()) {
+		entry.insert("emojis".to_string(), message["emojis"].clone());
 	}
 	if let Some(pic) = pic {
 		entry.insert("pic".to_string(), pic.into());

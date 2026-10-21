@@ -166,8 +166,8 @@ fn breakdown(stats: &Stats, emoji: usize) -> String {
 			stats.lengths.mean, stats.lengths.median, stats.lengths.max
 		));
 	}
-	if !stats.shortcodes.is_empty() {
-		out.push_str(&format!("Emoji        {}\n", pairs(stats.shortcodes.iter().take(emoji).map(|(k, v)| (format!(":{k}:"), *v)))));
+	if !stats.emoji.is_empty() {
+		out.push_str(&format!("Emoji        {}\n", pairs(stats.emoji.iter().take(emoji).map(|(k, v)| (k.clone(), *v)))));
 	}
 	out
 }

@@ -78,13 +78,49 @@
         }
         if (typeof node.id === "string" && typeof node.timestampUsec === "string") {
             stats.harvested++;
+            const emojis = [];
             meta.set(node.id, {
                 timestamp_usec: node.timestampUsec,
                 author_channel_id: node.authorExternalChannelId || null,
                 author_photo: photoUrl(node.authorPhoto),
+                // The message as its runs spell it, which says which emoji are
+                // characters and which are images in a way the DOM does not.
+                text: dataText(node.message, emojis),
+                emojis,
             });
         }
         for (const k in node) harvest(node[k], depth + 1);
+    }
+
+    // A run list flattened to text, as `runs_text` in replay.rs does it: a
+    // standard emoji is written as its character, and a custom one as its
+    // shortcut, added to `emojis` with its image once per message.
+    function dataText(node, emojis) {
+        const runs = node && Array.isArray(node.runs) ? node.runs : null;
+        if (!runs) return null;
+        let out = "";
+        for (const run of runs) {
+            if (typeof run.text === "string") {
+                out += run.text;
+            } else if (run.emoji) {
+                out += emojiText(run.emoji, emojis);
+            }
+        }
+        return out.trim() || null;
+    }
+
+    // One emoji run, as `emoji::text` writes it.
+    function emojiText(emoji, emojis) {
+        const id = typeof emoji.emojiId === "string" ? emoji.emojiId : null;
+        // An id of the form `<channel>/<emoji>` marks a custom one too, for a
+        // response that leaves the flag out.
+        const custom = emoji.isCustomEmoji === true || !id || id.includes("/");
+        if (!custom) return id;
+        const shortcut = (Array.isArray(emoji.shortcuts) && emoji.shortcuts[0]) || id || "";
+        if (id && !emojis.some((e) => e.id === id)) {
+            emojis.push({id, shortcut, url: photoUrl(emoji.image)});
+        }
+        return shortcut;
     }
 
     // The largest of a `{thumbnails: [{url}]}` image's sizes.
@@ -147,9 +183,11 @@
         };
     }
 
-    // A message body, flattened to text. Emoji are images, and the tooltip is
-    // the `:shortcode:` a viewer would have typed — `alt` gives the same name
-    // without the colons, which would run into the surrounding words.
+    // A message body, flattened to text from the DOM: the fallback for a
+    // message whose response we did not see. Emoji are images there. The `alt`
+    // of a standard one is its character, which is what we write; otherwise the
+    // tooltip is the `:shortcode:` a viewer would have typed, and `alt` gives the
+    // same name without the colons, which would run into the surrounding words.
     function runsText(node) {
         if (!node) return null;
         let out = "";
@@ -158,7 +196,11 @@
                 out += child.textContent;
             } else if (child.tagName === "IMG") {
                 const shortcode = child.getAttribute("shared-tooltip-text");
-                out += shortcode || (child.alt ? `:${child.alt}:` : "");
+                if (child.alt && /[^\x00-\x7f]/.test(child.alt)) {
+                    out += child.alt;
+                } else {
+                    out += shortcode || (child.alt ? `:${child.alt}:` : "");
+                }
             } else {
                 out += child.textContent || "";
             }
@@ -197,7 +239,10 @@
             badges: badges(el),
             // Absent on a sticker or a bare membership announcement, which say
             // everything they have to say in `kind` and `amount`.
-            text: runsText(el.querySelector("#message")),
+            text: "text" in data ? data.text : runsText(el.querySelector("#message")),
+            // The custom emoji in `text`, with their images. Only known from
+            // the response, so a message read from the DOM alone has none.
+            emojis: data.emojis || [],
             // Superchats and stickers only.
             amount: text(el, "#purchase-amount") || text(el, "#purchase-amount-chip"),
             // The membership tier, or the gift announcement's own wording.

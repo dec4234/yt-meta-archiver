@@ -75,7 +75,8 @@ On the dashboard, `--author` opens on that person with their overlay drawn.
 - `--bucket spec` — the time bucket for the chart: `30s`, `5m`, `1h`, or `auto`. `auto` is the default and gives the
   stream approximately forty bars.
 - `--author who` — select one chatter, as above.
-- `--emoji n` — how many emoji shortcodes to list. 10 by default.
+- `--emoji n` — how many emoji to list. 10 by default. It counts custom emoji by their shortcode and standard emoji by
+  their character. It also counts the shortcodes of standard emoji in transcripts from older versions.
 - `--width n` — the bar width for the plain report, in columns. 50 by default. The dashboard sizes its own chart to the
   terminal.
 - `--plain` — print the flat text report instead of the dashboard.

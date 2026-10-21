@@ -27,8 +27,9 @@ use log::{debug, info, trace, warn};
 use serde_json::{Value, json};
 
 use super::watch::{self, TRANSCRIPT_FILE};
+use crate::image_store::ImageStore;
 use crate::profile_picture::ProfilePictures;
-use crate::{http, video};
+use crate::{emoji, http, video};
 
 /// The endpoint the replay chat paginates through. Its `key` is the public
 /// InnerTube key every watch page carries, not a credential of ours.
@@ -122,7 +123,7 @@ pub(super) fn probe(video_id: &str) -> Result<Chat> {
 /// Like the live path this appends and deduplicates rather than truncating, so a
 /// replay run over a directory that already holds a partial live capture fills
 /// in what was missed instead of throwing away what was caught.
-pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&ProfilePictures>) -> Result<usize> {
+pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&ProfilePictures>, emojis: Option<&ImageStore>) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 	let path = out_dir.join(TRANSCRIPT_FILE);
 
@@ -167,6 +168,7 @@ pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&Profile
 			// the message was said.
 			entry["offset_ms"] = at_ms.into();
 			watch::attach_picture(&mut entry, &message, pictures);
+			emoji::attach_images(&mut entry, emojis);
 			writeln!(transcript, "{}", serde_json::to_string(&entry)?).context("writing the transcript")?;
 			written += 1;
 			trace!("[{}] {} {}", already + written, stream_time(at_ms), watch::summarise(&entry));
@@ -241,6 +243,12 @@ fn describe(item: &Value) -> Option<Value> {
 	// in the header the announcement is drawn from.
 	let header = &renderer["header"]["liveChatSponsorshipsHeaderRenderer"];
 	let author = simple_text(&renderer["authorName"]).or_else(|| simple_text(&header["authorName"]));
+	let mut emojis = Vec::new();
+	// Absent on a sticker and on a gift purchase, which say everything they
+	// have to say in `kind`, `amount` and `header`.
+	let text = runs_text(&renderer["message"], &mut emojis);
+	// The membership tier, or the gift announcement's own wording.
+	let subtext = runs_text(&renderer["headerSubtext"], &mut emojis).or_else(|| runs_text(&header["primaryText"], &mut emojis));
 
 	Some(json!({
 		"id": renderer["id"].as_str(),
@@ -251,13 +259,12 @@ fn describe(item: &Value) -> Option<Value> {
 		// from, when one is wanted.
 		"author_photo": renderer["authorPhoto"]["thumbnails"].as_array().and_then(|t| t.last()).and_then(|t| t["url"].as_str()),
 		"badges": badges(&renderer),
-		// Absent on a sticker and on a gift purchase, which say everything they
-		// have to say in `kind`, `amount` and `header`.
-		"text": runs_text(&renderer["message"]),
+		"text": text,
+		// The custom emoji in `text` and `header`, with their images.
+		"emojis": emojis,
 		// Superchats and stickers only.
 		"amount": simple_text(&renderer["purchaseAmountText"]),
-		// The membership tier, or the gift announcement's own wording.
-		"header": runs_text(&renderer["headerSubtext"]).or_else(|| runs_text(&header["primaryText"])),
+		"header": subtext,
 		"timestamp_usec": renderer["timestampUsec"].as_str(),
 	}))
 }
@@ -286,21 +293,18 @@ fn simple_text(node: &Value) -> Option<String> {
 }
 
 /// A run list flattened to text. Emoji are their own runs rather than
-/// characters, and every one carries the `:shortcode:` a viewer would have
-/// typed — which is exactly what the live path recovers from the DOM, so both
+/// characters: a standard one is written as its character and a custom one as
+/// its shortcut, which is added to `emojis` (see [`emoji::text`]). The live path
+/// reads the same runs out of the responses its page receives, so both
 /// transcripts spell a message the same way.
-fn runs_text(node: &Value) -> Option<String> {
+fn runs_text(node: &Value, emojis: &mut Vec<Value>) -> Option<String> {
 	let runs = node["runs"].as_array()?;
 	let mut out = String::new();
 	for run in runs {
 		if let Some(text) = run["text"].as_str() {
 			out.push_str(text);
-		} else if let Some(emoji) = run["emoji"].as_object() {
-			let emoji = Value::Object(emoji.clone());
-			// Custom channel emoji have nothing but a shortcode; a plain one also
-			// carries the character itself, under `emojiId`.
-			let shortcode = emoji["shortcuts"][0].as_str().or_else(|| emoji["emojiId"].as_str());
-			out.push_str(shortcode.unwrap_or_default());
+		} else if run["emoji"].is_object() {
+			out.push_str(&emoji::text(&run["emoji"], emojis));
 		}
 	}
 	let out = out.trim();
@@ -392,8 +396,9 @@ mod tests {
 		assert_eq!(message["author_channel_id"], "UCwnwSNvMnLnIuwi4Xmhj98g");
 		assert_eq!(message["badges"], json!(["Member (2 years)"]));
 		assert_eq!(message["timestamp_usec"], "1773447089082651");
-		// Emoji come out as the shortcode a viewer typed, as they do live.
-		assert_eq!(message["text"], "hello :saluting_face:");
+		// A standard emoji comes out as its character, as it does live.
+		assert_eq!(message["text"], "hello \u{1fae1}");
+		assert_eq!(message["emojis"], json!([]));
 		assert!(message["amount"].is_null());
 	}
 
@@ -403,8 +408,28 @@ mod tests {
 		let entry = watch::entry(&message, 0, None);
 		assert_eq!(entry["seq"], 1);
 		assert_eq!(entry["author"], "@Someone");
-		assert_eq!(entry["text"], "hello :saluting_face:");
+		assert_eq!(entry["text"], "hello \u{1fae1}");
+		// No custom emoji, so no list.
+		assert!(entry.get("emojis").is_none());
 		assert_eq!(entry["sent_utc"], "2026-03-14T00:11:29Z");
+	}
+
+	#[test]
+	fn keeps_a_custom_emoji_as_its_shortcut_with_its_image() {
+		let emote = json!({
+			"liveChatTextMessageRenderer": {
+				"id": "ChwKGkNNMkZsNTZObnBNREZn",
+				"message": {"runs": [
+					{"emoji": {"emojiId": "UCabc/xyz", "isCustomEmoji": true, "shortcuts": [":_channelEmote:"], "image": {"thumbnails": [{"url": "https://yt3.ggpht.com/e=w24-h24"}, {"url": "https://yt3.ggpht.com/e=w48-h48"}]}}},
+					{"text": " gg "},
+					{"emoji": {"emojiId": "\u{1f602}", "shortcuts": [":face_with_tears_of_joy:"]}},
+				]},
+			}
+		});
+		let message = describe(&emote).expect("a message");
+		assert_eq!(message["text"], ":_channelEmote: gg \u{1f602}");
+		let entry = watch::entry(&message, 0, None);
+		assert_eq!(entry["emojis"], json!([{"id": "UCabc/xyz", "shortcut": ":_channelEmote:", "url": "https://yt3.ggpht.com/e=w48-h48"}]));
 	}
 
 	#[test]

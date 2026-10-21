@@ -74,8 +74,9 @@ pub struct Stats {
 	/// (`Member (2 years)`, `Member (6 months)`) and would otherwise splinter
 	/// the badge counts into a row per tier.
 	pub member_tiers: BTreeMap<String, usize>,
-	/// Emoji shortcodes, most first.
-	pub shortcodes: Vec<(String, usize)>,
+	/// Emoji as they are written in the text, `:shortcode:` or character, most
+	/// first.
+	pub emoji: Vec<(String, usize)>,
 	pub lengths: Lengths,
 	pub money: BTreeMap<String, MoneyStat>,
 	/// Amounts in a shape [`parse_amount`] did not recognise. Shown rather than
@@ -108,7 +109,7 @@ pub fn collect(records: &[Record], failures: usize) -> Stats {
 	let mut kinds: BTreeMap<String, usize> = BTreeMap::new();
 	let mut badges: BTreeMap<String, usize> = BTreeMap::new();
 	let mut member_tiers: BTreeMap<String, usize> = BTreeMap::new();
-	let mut shortcodes: HashMap<String, usize> = HashMap::new();
+	let mut emoji: HashMap<String, usize> = HashMap::new();
 	let mut money: BTreeMap<String, MoneyStat> = BTreeMap::new();
 	let mut unparsable_amounts = 0;
 	let mut lengths = Vec::new();
@@ -138,8 +139,8 @@ pub fn collect(records: &[Record], failures: usize) -> Stats {
 
 		if let Some(text) = &record.text {
 			lengths.push(text.chars().count());
-			for code in scan_shortcodes(text) {
-				*shortcodes.entry(code).or_default() += 1;
+			for token in scan_emoji(text) {
+				*emoji.entry(token).or_default() += 1;
 			}
 		}
 
@@ -168,8 +169,8 @@ pub fn collect(records: &[Record], failures: usize) -> Stats {
 	// order is not, and a table that reshuffles itself is hard to trust.
 	authors.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
 
-	let mut shortcodes: Vec<(String, usize)> = shortcodes.into_iter().collect();
-	shortcodes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+	let mut emoji: Vec<(String, usize)> = emoji.into_iter().collect();
+	emoji.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 
 	let placed: Vec<i64> = offsets.iter().flatten().copied().collect();
 
@@ -180,7 +181,7 @@ pub fn collect(records: &[Record], failures: usize) -> Stats {
 		kinds,
 		badges,
 		member_tiers,
-		shortcodes,
+		emoji,
 		lengths: summarise_lengths(lengths),
 		money,
 		unparsable_amounts,
@@ -343,37 +344,109 @@ pub fn parse_bucket_spec(spec: &str) -> Option<Option<i64>> {
 	Some(Some(number * scale))
 }
 
-/// The `:shortcode:` tokens in a message.
+/// The emoji in a message, each as it is written: a `:shortcode:` or the
+/// character itself.
 ///
-/// Both capture paths flatten emoji runs to the shortcode a viewer would have
-/// typed, so this is the whole of the emoji data — there are no raw characters
-/// to count. Scanning colon to colon rather than splitting on them is what makes
-/// `:kiss::kiss:` two emoji instead of one: a split sees an empty field between
-/// the pair and loses track of which colons open and which close.
-pub fn scan_shortcodes(text: &str) -> Vec<String> {
+/// The archiver writes a standard emoji as its character and a custom one as
+/// its shortcode. Older transcripts wrote every emoji as a shortcode, so both
+/// are counted. Scanning colon to colon rather than splitting on them is what
+/// makes `:kiss::kiss:` two emoji instead of one: a split sees an empty field
+/// between the pair and loses track of which colons open and which close.
+pub fn scan_emoji(text: &str) -> Vec<String> {
 	let mut out = Vec::new();
 	let bytes = text.as_bytes();
 	let mut i = 0;
 	while i < bytes.len() {
-		if bytes[i] != b':' {
+		if bytes[i] == b':' {
+			// The body has to look like a shortcode, which is what keeps
+			// `https://` and ordinary prose punctuation out of the counts.
+			let mut j = i + 1;
+			while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'+' | b'-')) {
+				j += 1;
+			}
+			if j > i + 1 && j < bytes.len() && bytes[j] == b':' {
+				out.push(text[i..=j].to_string());
+				// Past the closing colon, so it cannot also open the next token.
+				i = j + 1;
+			} else {
+				i += 1;
+			}
+			continue;
+		}
+		if !text.is_char_boundary(i) {
 			i += 1;
 			continue;
 		}
-		// The body has to look like a shortcode, which is what keeps `https://`
-		// and ordinary prose punctuation out of the counts.
-		let mut j = i + 1;
-		while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || matches!(bytes[j], b'_' | b'+' | b'-')) {
-			j += 1;
-		}
-		if j > i + 1 && j < bytes.len() && bytes[j] == b':' {
-			out.push(text[i + 1..j].to_string());
-			// Past the closing colon, so it cannot also open the next token.
-			i = j + 1;
+		let len = emoji_len(&text[i..]);
+		if len > 0 {
+			out.push(text[i..i + len].to_string());
+			i += len;
 		} else {
-			i += 1;
+			i += text[i..].chars().next().map_or(1, char::len_utf8);
 		}
 	}
 	out
+}
+
+/// The length in bytes of the emoji `text` starts with, or 0 if it does not
+/// start with one. One emoji can be many characters: a skin tone, a variation
+/// selector, a flag's pair of letters, or several pictures joined by a
+/// zero-width joiner (👨‍👩‍👧) all make one emoji.
+fn emoji_len(text: &str) -> usize {
+	let mut chars = text.char_indices().peekable();
+	let Some((_, first)) = chars.next() else {
+		return 0;
+	};
+	// A digit, `#` or `*` is an emoji only with a keycap after it.
+	let keycap_base = first.is_ascii_digit() || first == '#' || first == '*';
+	if !is_pictograph(first) && !keycap_base {
+		return 0;
+	}
+	let mut end = first.len_utf8();
+	let mut letters = usize::from(is_regional_letter(first));
+	let mut keycap = false;
+	while let Some(&(at, c)) = chars.peek() {
+		if is_modifier(c) {
+			keycap |= c == '\u{20e3}';
+		} else if is_regional_letter(c) && letters == 1 {
+			// A flag is exactly two letters; a third starts the next flag.
+			letters += 1;
+		} else if c == '\u{200d}' {
+			chars.next();
+			match chars.peek() {
+				Some(&(next_at, next)) if is_pictograph(next) => end = next_at + next.len_utf8(),
+				_ => break,
+			}
+		} else {
+			break;
+		}
+		chars.next();
+		end = end.max(at + c.len_utf8());
+	}
+	if keycap_base && !keycap {
+		return 0;
+	}
+	end
+}
+
+/// A character that is an emoji's picture. The blocks are where Unicode keeps
+/// them; a few in them are not emoji, but those are rare in chat.
+fn is_pictograph(c: char) -> bool {
+	matches!(
+		c as u32,
+		0x1f000..=0x1faff | 0x2600..=0x27bf | 0x2300..=0x23ff | 0x2b00..=0x2bff | 0x3030 | 0x303d | 0x3297 | 0x3299
+	)
+}
+
+/// A regional indicator letter, two of which make a flag.
+fn is_regional_letter(c: char) -> bool {
+	('\u{1f1e6}'..='\u{1f1ff}').contains(&c)
+}
+
+/// A character that changes the emoji before it rather than standing alone: a
+/// variation selector, a skin tone, a keycap, or a subdivision flag's tag.
+fn is_modifier(c: char) -> bool {
+	matches!(c as u32, 0xfe0e | 0xfe0f | 0x1f3fb..=0x1f3ff | 0x20e3 | 0xe0020..=0xe007f)
 }
 
 /// `£5.00` -> `("£", 5.0)`. The currency is whatever leads the number, which is
@@ -442,18 +515,34 @@ mod tests {
 
 	#[test]
 	fn counts_adjacent_shortcodes_separately() {
-		assert_eq!(scan_shortcodes(":kiss::kiss:"), vec!["kiss", "kiss"]);
-		assert_eq!(scan_shortcodes("uff:collision:"), vec!["collision"]);
+		assert_eq!(scan_emoji(":kiss::kiss:"), vec![":kiss:", ":kiss:"]);
+		assert_eq!(scan_emoji("uff:collision:"), vec![":collision:"]);
 		// Custom channel emoji use hyphens, which real transcripts are full of.
-		assert_eq!(scan_shortcodes(":face-green-smiling: hi :hand-pink-waving:"), vec!["face-green-smiling", "hand-pink-waving"]);
+		assert_eq!(scan_emoji(":face-green-smiling: hi :hand-pink-waving:"), vec![":face-green-smiling:", ":hand-pink-waving:"]);
 	}
 
 	#[test]
 	fn leaves_colons_that_are_not_emoji_alone() {
-		assert!(scan_shortcodes("see https://youtu.be/x").is_empty());
-		assert!(scan_shortcodes("time: 22:15").is_empty());
-		assert!(scan_shortcodes("::").is_empty());
-		assert!(scan_shortcodes("no colons here").is_empty());
+		assert!(scan_emoji("see https://youtu.be/x").is_empty());
+		assert!(scan_emoji("time: 22:15").is_empty());
+		assert!(scan_emoji("::").is_empty());
+		assert!(scan_emoji("no colons here").is_empty());
+	}
+
+	#[test]
+	fn counts_emoji_written_as_characters() {
+		assert_eq!(scan_emoji("lol \u{1f602}\u{1f602} :_channelEmote:"), vec!["\u{1f602}", "\u{1f602}", ":_channelEmote:"]);
+		// A heart with its variation selector is one emoji, not two.
+		assert_eq!(scan_emoji("\u{2764}\u{fe0f}"), vec!["\u{2764}\u{fe0f}"]);
+		// So is a wave with a skin tone, and a family joined into one picture.
+		assert_eq!(scan_emoji("\u{1f44b}\u{1f3fd}"), vec!["\u{1f44b}\u{1f3fd}"]);
+		assert_eq!(scan_emoji("\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"), vec!["\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"]);
+		// Two flags side by side are two flags.
+		assert_eq!(scan_emoji("\u{1f1ec}\u{1f1e7}\u{1f1fa}\u{1f1f8}"), vec!["\u{1f1ec}\u{1f1e7}", "\u{1f1fa}\u{1f1f8}"]);
+		// A digit is only an emoji with a keycap.
+		assert_eq!(scan_emoji("1 2\u{fe0f}\u{20e3}"), vec!["2\u{fe0f}\u{20e3}"]);
+		// Letters from other scripts are not emoji.
+		assert!(scan_emoji("caf\u{e9} \u{65e5}\u{672c}").is_empty());
 	}
 
 	fn records(lines: &[&str]) -> Vec<Record> {
@@ -478,7 +567,7 @@ mod tests {
 		// The tier is collapsed for the count and kept for the detail.
 		assert_eq!(stats.badges["Member"], 1);
 		assert_eq!(stats.member_tiers["Member (2 years)"], 1);
-		assert_eq!(stats.shortcodes, vec![("kiss".to_string(), 1)]);
+		assert_eq!(stats.emoji, vec![(":kiss:".to_string(), 1)]);
 		assert_eq!(stats.money["£"].messages, 1);
 		assert_eq!(stats.money["£"].total, 5.0);
 		assert_eq!(stats.money["£"].top, Some(("@b".to_string(), 5.0)));

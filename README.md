@@ -65,7 +65,7 @@ Writes the comments of one video to `<out>/<video id>/comments.json`. `<video>` 
 ## Live chat
 
 ```
-yt-meta-archiver livechat <stream> [--pic] [--compress [quality]] [--grab-profile-picture [dir]] [--out <dir>]
+yt-meta-archiver livechat <stream> [--pic] [--compress [quality]] [--grab-profile-picture [dir]] [--grab-emoji [dir]] [--out <dir>]
 ```
 
 Follows a livestream's chat and appends each message to `<out>/<video id>/chat.jsonl`, one JSON object per line.
@@ -77,6 +77,12 @@ no flag, no browser, and much faster. Replay lines carry an `offset_ms`, how far
 Not every VOD keeps a replay.
 
 `--pic` screenshots each message. It applies to a live chat only, because a replay comes from the API and not a page.
+
+A standard emoji is written in `text` as its Unicode character, for example `😂`. A custom emoji (a channel member emoji,
+or a YouTube emoji such as `:yt:` or `:hand-pink-waving:`) is an image, so `text` keeps its shortcut, for example
+`:_channelEmote:`. The line also gets an `emojis` list with the `id`, `shortcut` and image `url` of each custom emoji.
+`--grab-emoji` saves these images into one shared directory (`emojis` for a bare flag) and adds an `image` path to each.
+An image that is already there is used again, not downloaded again.
 
 The run continues until the chat closes or you stop it, and restarts the browser by itself if it dies. The transcript is
 appended to and deduplicated by message id, so you can re-run over the same directory to add what is missing.

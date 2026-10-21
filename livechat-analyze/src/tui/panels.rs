@@ -230,11 +230,8 @@ fn breakdown(frame: &mut Frame, stats: &Stats, area: Rect) {
 			format!("mean {} chars   median {}   longest {}", stats.lengths.mean, stats.lengths.median, stats.lengths.max),
 		));
 	}
-	if !stats.shortcodes.is_empty() {
-		lines.push(entry(
-			"Emoji",
-			stats.shortcodes.iter().take(8).map(|(k, v)| format!(":{k}: {}", commas(*v))).collect::<Vec<_>>().join("   "),
-		));
+	if !stats.emoji.is_empty() {
+		lines.push(entry("Emoji", stats.emoji.iter().take(8).map(|(k, v)| format!("{k} {}", commas(*v))).collect::<Vec<_>>().join("   ")));
 	}
 
 	let block = Block::bordered().title(" Breakdown ").border_style(Style::default().fg(MUTED));

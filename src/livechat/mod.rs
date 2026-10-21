@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use log::{info, warn};
 
-use crate::{browser, profile_picture, video};
+use crate::{browser, emoji, profile_picture, video};
 
 const DEFAULT_OUT_DIR: &str = "livechat";
 
@@ -50,6 +50,9 @@ pub struct Args {
 
 	#[command(flatten)]
 	profile_pictures: profile_picture::Args,
+
+	#[command(flatten)]
+	emojis: emoji::Args,
 }
 
 pub fn run(args: &Args) -> Result<()> {
@@ -57,6 +60,7 @@ pub fn run(args: &Args) -> Result<()> {
 	let out_dir = args.out.join(&stream.video_id);
 	let transcript = out_dir.join(watch::TRANSCRIPT_FILE);
 	let pictures = args.profile_pictures.open()?;
+	let emojis = args.emojis.open()?;
 
 	info!("stream:  {}", video::watch_url(&stream.video_id));
 	if let Some(title) = &stream.title {
@@ -80,7 +84,7 @@ pub fn run(args: &Args) -> Result<()> {
 			if args.pic {
 				warn!("--pic wants a rendered chat and a replay has none, so this run is the transcript only");
 			}
-			replay::archive(&replay, &out_dir, pictures.as_ref())?
+			replay::archive(&replay, &out_dir, pictures.as_ref(), emojis.as_ref())?
 		}
 		replay::Chat::Live | replay::Chat::Unknown => {
 			let format = browser::ImageFormat::from_arg(args.compress);
@@ -91,13 +95,16 @@ pub fn run(args: &Args) -> Result<()> {
 				}
 			}
 			info!("following the chat — interrupt with Ctrl-C to stop");
-			watch::watch(&stream, &out_dir, args.pic, format, pictures.as_ref())?
+			watch::watch(&stream, &out_dir, args.pic, format, pictures.as_ref(), emojis.as_ref())?
 		}
 	};
 
 	info!("wrote {written} messages to {}", transcript.display());
 	if let Some(pictures) = &pictures {
 		pictures.report();
+	}
+	if let Some(emojis) = &emojis {
+		emoji::report(emojis);
 	}
 	Ok(())
 }

@@ -46,7 +46,7 @@ struct Args {
 	#[arg(long, value_name = "WHO")]
 	author: Option<String>,
 
-	/// How many emoji shortcodes to list.
+	/// How many emoji to list.
 	#[arg(long, value_name = "N", default_value_t = 10)]
 	emoji: usize,
 
