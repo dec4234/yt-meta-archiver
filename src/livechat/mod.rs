@@ -12,9 +12,11 @@
 //! choosing between them on what the video turns out to be — [`watch`] follows a
 //! live chat through a browser, [`replay`] reads a finished one over HTTP.
 
-mod replay;
-mod source;
+pub mod replay;
+pub mod source;
 mod watch;
+
+pub use watch::TRANSCRIPT_FILE;
 
 use std::path::PathBuf;
 

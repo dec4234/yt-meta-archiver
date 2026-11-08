@@ -471,3 +471,41 @@ fn file_name(i: usize, id: Option<&str>, format: ImageFormat) -> String {
 		.unwrap_or_else(|| "unknown".to_string());
 	format!("{:04}_{}.{}", i + 1, id, format.extension())
 }
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	#[test]
+	fn names_captures_in_feed_order() {
+		assert_eq!(file_name(0, Some("UgkxAbC"), ImageFormat::Png), "0001_UgkxAbC.png");
+		assert_eq!(file_name(41, Some("Ugkx/../AbC"), ImageFormat::Webp(80)), "0042_UgkxAbC.webp");
+		assert_eq!(file_name(0, Some("///"), ImageFormat::Png), "0001_unknown.png");
+		assert_eq!(file_name(0, None, ImageFormat::Png), "0001_unknown.png");
+	}
+
+	#[test]
+	fn an_entry_without_a_lookup_leaves_the_details_out() {
+		let entry = index_entry(Some("UgkxAbC"), &json!("2 years ago"), None);
+		assert_eq!(entry, json!({"url": "https://www.youtube.com/post/UgkxAbC", "posted_relative": "2 years ago"}));
+	}
+
+	#[test]
+	fn an_entry_with_an_empty_lookup_says_so_with_nulls() {
+		let entry = index_entry(None, &Value::Null, Some(Details::default()));
+		assert_eq!(entry, json!({"url": null, "posted_utc": null, "text": null, "posted_relative": null}));
+	}
+
+	#[test]
+	fn an_entry_carries_the_details_found() {
+		let details = Details {
+			published_utc: Some("2023-10-03T17:20:08Z".to_string()),
+			text: Some("hello".to_string()),
+		};
+		let entry = index_entry(Some("abc"), &json!("1 day ago"), Some(details));
+		assert_eq!(entry["posted_utc"], "2023-10-03T17:20:08Z");
+		assert_eq!(entry["text"], "hello");
+	}
+}

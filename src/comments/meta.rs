@@ -134,6 +134,53 @@ mod tests {
 	}
 
 	#[test]
+	fn reads_every_field_the_page_gives() {
+		let meta = Meta::from_value(&serde_json::json!({
+			"id": " Ugx1 ",
+			"author": "@Someone",
+			"authorUrl": "https://www.youtube.com/@Someone",
+			"text": "hello",
+			"likes": "12",
+			"replies": "3 replies",
+			"published": "2 days ago",
+			"pinned": true,
+			"hearted": true,
+		}));
+		assert_eq!(meta.id.as_deref(), Some("Ugx1"));
+		assert_eq!(meta.likes, 12);
+		assert_eq!(meta.replies, 3);
+		assert!(meta.pinned && meta.hearted);
+	}
+
+	#[test]
+	fn builds_an_index_entry() {
+		let meta = Meta {
+			author: Some("@Someone".to_string()),
+			likes: 5,
+			likes_text: Some("5".to_string()),
+			published: Some("1 hour ago".to_string()),
+			..Meta::default()
+		};
+		let entry = entry(&meta, Some("https://example.com/c".to_string()), Some("0001_x.png"));
+		assert_eq!(
+			entry,
+			serde_json::json!({
+				"url": "https://example.com/c",
+				"author": "@Someone",
+				"author_url": null,
+				"text": null,
+				"likes": 5,
+				"likes_text": "5",
+				"replies": 0,
+				"pinned": false,
+				"hearted": false,
+				"posted_relative": "1 hour ago",
+				"screenshot": "0001_x.png",
+			})
+		);
+	}
+
+	#[test]
 	fn keeps_only_what_is_safe_in_a_file_name() {
 		assert_eq!(sanitize(Some("Ugkx/../Abc")), "UgkxAbc");
 		assert_eq!(sanitize(Some("")), "unknown");

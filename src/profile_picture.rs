@@ -121,14 +121,20 @@ impl ProfilePictures {
 /// The avatar URL a channel page carries. Its `og:image` is the avatar at full
 /// size; the page data's own `avatar` is the fallback for a page without one.
 fn channel_picture_url(channel_url: &str) -> Result<String> {
-	let html = http::get_html(channel_url)?;
-	between(&html, "<meta property=\"og:image\" content=\"", "\"")
-		.or_else(|| between(&html, "\"avatar\":{\"thumbnails\":[{\"url\":\"", "\""))
+	picture_url_from_html(&http::get_html(channel_url)?, channel_url)
+}
+
+/// The avatar URL an already fetched channel page carries. `channel_url` is
+/// only for the error.
+pub fn picture_url_from_html(html: &str, channel_url: &str) -> Result<String> {
+	between(html, "<meta property=\"og:image\" content=\"", "\"")
+		.or_else(|| between(html, "\"avatar\":{\"thumbnails\":[{\"url\":\"", "\""))
 		.map(|url| url.replace("&amp;", "&"))
 		.filter(|url| url.starts_with("http"))
 		.ok_or_else(|| anyhow!("no profile picture on {channel_url}"))
 }
 
+/// The text between the first `start` in `text` and the `end` after it.
 pub fn between<'a>(text: &'a str, start: &str, end: &str) -> Option<&'a str> {
 	let from = text.find(start)? + start.len();
 	let len = text[from..].find(end)?;
@@ -161,6 +167,70 @@ mod tests {
 		assert_eq!(resize("https://yt3.googleusercontent.com/abc=s900", SIZE), "https://yt3.googleusercontent.com/abc=s176");
 		assert_eq!(resize("https://yt3.googleusercontent.com/abc=s900", 800), "https://yt3.googleusercontent.com/abc=s800");
 		assert_eq!(resize("https://example.com/a.png", SIZE), "https://example.com/a.png");
+	}
+
+	#[test]
+	fn leaves_a_size_suffix_without_digits_alone() {
+		assert_eq!(resize("https://example.com/a=stuff", SIZE), "https://example.com/a=stuff");
+	}
+
+	#[test]
+	fn finds_text_between_two_markers() {
+		assert_eq!(between("a[b]c", "[", "]"), Some("b"));
+		assert_eq!(between("a[]c", "[", "]"), Some(""));
+		assert_eq!(between("a[b", "[", "]"), None);
+		assert_eq!(between("abc", "[", "]"), None);
+	}
+
+	#[test]
+	fn reads_the_avatar_off_a_channel_page() {
+		let og = r#"<meta property="og:image" content="https://yt3.googleusercontent.com/a=s900-c-k?x=1&amp;y=2">"#;
+		assert_eq!(picture_url_from_html(og, "c").unwrap(), "https://yt3.googleusercontent.com/a=s900-c-k?x=1&y=2");
+
+		// A page without og:image still has the avatar in its data.
+		let data = r#"{"avatar":{"thumbnails":[{"url":"https://yt3.ggpht.com/b=s88","width":88}]}}"#;
+		assert_eq!(picture_url_from_html(data, "c").unwrap(), "https://yt3.ggpht.com/b=s88");
+
+		// Something that is not a URL is no picture.
+		assert!(picture_url_from_html(r#"<meta property="og:image" content="/relative.png">"#, "c").is_err());
+		assert!(picture_url_from_html("<html></html>", "c").is_err());
+	}
+
+	#[test]
+	fn attaches_pictures_to_comments_and_their_replies() {
+		let dir = std::env::temp_dir().join(format!("yta-pp-attach-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join("@Parent.png"), b"x").unwrap();
+		std::fs::write(dir.join("@Child.jpg"), b"x").unwrap();
+
+		let pictures = ProfilePictures::new(ImageStore::new(&dir, "profile picture", false), SIZE);
+		let mut entries = vec![
+			serde_json::json!({
+				"author_url": "https://www.youtube.com/@Parent",
+				"subcomments": [{"author_url": "https://www.youtube.com/@Child"}],
+			}),
+			// No author URL: left as it is.
+			serde_json::json!({"text": "anonymous"}),
+			serde_json::json!("not an object"),
+		];
+		pictures.attach_to_comments(&mut entries);
+
+		assert!(entries[0]["profile_picture"].as_str().is_some_and(|p| p.ends_with("/@Parent.png")));
+		assert!(entries[0]["subcomments"][0]["profile_picture"].as_str().is_some_and(|p| p.ends_with("/@Child.jpg")));
+		assert!(entries[1].get("profile_picture").is_none());
+		assert_eq!(pictures.store().counts(), (0, 2));
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn a_url_that_names_no_channel_has_no_picture() {
+		let dir = std::env::temp_dir().join(format!("yta-pp-none-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let pictures = ProfilePictures::new(ImageStore::new(&dir, "profile picture", false), SIZE);
+		assert_eq!(pictures.for_channel_url("https://www.youtube.com/watch?v=abc"), None);
+		assert_eq!(pictures.for_channel_id("///", None), None);
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]

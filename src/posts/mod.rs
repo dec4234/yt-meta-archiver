@@ -3,7 +3,7 @@
 
 mod archive;
 mod comments;
-mod details;
+pub mod details;
 
 use std::path::{Path, PathBuf};
 
@@ -142,4 +142,32 @@ fn post_url(post_id: &str) -> String {
 fn out_dir_for(posts_url: &str, base: &Path) -> PathBuf {
 	let handle = posts_url.split('/').find(|s| s.starts_with('@')).map(|s| s.trim_start_matches('@')).unwrap_or("channel");
 	base.join(handle)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn builds_the_posts_tab_from_any_channel_input() {
+		let want = "https://www.youtube.com/@Someone/posts";
+		assert_eq!(posts_url("@Someone"), want);
+		assert_eq!(posts_url("Someone"), want);
+		assert_eq!(posts_url(" https://www.youtube.com/@Someone/ "), want);
+		assert_eq!(posts_url("https://www.youtube.com/@Someone/posts/"), want);
+		assert_eq!(posts_url("https://www.youtube.com/channel/UCabc"), "https://www.youtube.com/channel/UCabc/posts");
+	}
+
+	#[test]
+	fn builds_a_single_posts_page() {
+		assert_eq!(post_url("UgkxAbC"), "https://www.youtube.com/post/UgkxAbC");
+	}
+
+	#[test]
+	fn files_screenshots_under_the_handle() {
+		let base = Path::new("shots");
+		assert_eq!(out_dir_for("https://www.youtube.com/@Someone/posts", base), base.join("Someone"));
+		// A channel id URL has no handle to name the folder after.
+		assert_eq!(out_dir_for("https://www.youtube.com/channel/UCabc/posts", base), base.join("channel"));
+	}
 }

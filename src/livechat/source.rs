@@ -125,6 +125,38 @@ mod tests {
 	}
 
 	#[test]
+	fn takes_a_video_id_at_its_word_without_a_request() {
+		let stream = resolve(" https://youtu.be/dQw4w9WgXcQ ").unwrap();
+		assert_eq!(stream.video_id, "dQw4w9WgXcQ");
+		assert!(stream.title.is_none());
+	}
+
+	#[test]
+	fn an_empty_input_is_an_error() {
+		assert!(resolve("   ").is_err());
+	}
+
+	#[test]
+	fn builds_the_popout_chat_url() {
+		assert_eq!(chat_url("dQw4w9WgXcQ"), "https://www.youtube.com/live_chat?v=dQw4w9WgXcQ&is_popout=1");
+	}
+
+	#[test]
+	fn reads_attributes_and_undoes_entities() {
+		assert_eq!(attribute(r#"<a href="x" title="y">"#, "title"), Some("y"));
+		assert_eq!(attribute(r#"<a href="x">"#, "title"), None);
+		assert_eq!(unescape_entities("&quot;a&quot; &amp; b &lt;c&gt; it&#39;s"), "\"a\" & b <c> it's");
+		// &amp; goes last, so an escaped entity stays escaped once.
+		assert_eq!(unescape_entities("&amp;lt;"), "&lt;");
+	}
+
+	#[test]
+	fn an_empty_title_is_no_title() {
+		assert_eq!(meta_content(r#"<meta name="title" content="">"#, "title"), None);
+		assert_eq!(meta_content("<html></html>", "title"), None);
+	}
+
+	#[test]
 	fn reports_a_channel_that_is_not_live() {
 		// What YouTube serves when /live falls back to the channel page.
 		let html = r#"<link rel="canonical" href="https://www.youtube.com/@Someone">"#;

@@ -90,4 +90,49 @@ mod tests {
 	fn the_command_line_is_well_formed() {
 		Cli::command().debug_assert();
 	}
+
+	#[test]
+	fn an_explicit_worker_count_is_taken_as_given() {
+		assert_eq!(worker_count(1), 1);
+		assert_eq!(worker_count(7), 7);
+	}
+
+	#[test]
+	fn a_bare_mt_flag_picks_between_two_and_four_workers() {
+		let workers = worker_count(0);
+		assert!((2..=4).contains(&workers), "{workers}");
+	}
+
+	#[test]
+	fn every_subcommand_parses() {
+		for args in [
+			&["yta", "posts", "@Someone", "--max", "3", "--details"][..],
+			&["yta", "comments", "dQw4w9WgXcQ", "--pic", "--compress", "--subcomments", "2"],
+			&["yta", "livechat", "@Someone", "--grab-emoji"],
+			&["yta", "pfp", "@a", "@b", "--size", "88", "--mt"],
+			&["yta", "profile-pictures", "@a"],
+			&["yta", "banner", "@a", "--cropped", "-vv"],
+		] {
+			assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+		}
+	}
+
+	#[test]
+	fn rejects_bad_arguments() {
+		// --compress means nothing without --pic.
+		assert!(Cli::try_parse_from(["yta", "comments", "dQw4w9WgXcQ", "--compress"]).is_err());
+		// The picture size is bounded.
+		assert!(Cli::try_parse_from(["yta", "pfp", "@a", "--size", "8"]).is_err());
+		assert!(Cli::try_parse_from(["yta", "pfp", "@a", "--size", "901"]).is_err());
+		assert!(Cli::try_parse_from(["yta", "nothing"]).is_err());
+		assert!(Cli::try_parse_from(["yta"]).is_err());
+	}
+
+	#[test]
+	fn counts_verbose_flags() {
+		let cli = Cli::try_parse_from(["yta", "-vv", "banner", "@a"]).unwrap();
+		assert_eq!(cli.verbose, 2);
+		let cli = Cli::try_parse_from(["yta", "banner", "@a"]).unwrap();
+		assert_eq!(cli.verbose, 0);
+	}
 }

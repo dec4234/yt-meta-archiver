@@ -118,6 +118,37 @@ mod tests {
 	}
 
 	#[test]
+	fn formats_epoch_seconds() {
+		assert_eq!(from_epoch_secs(0), "1970-01-01T00:00:00Z");
+		assert_eq!(from_epoch_secs(1_700_000_000), "2023-11-14T22:13:20Z");
+		// Before the epoch, and the last second of a leap day.
+		assert_eq!(from_epoch_secs(-1), "1969-12-31T23:59:59Z");
+		assert_eq!(from_epoch_secs(951_868_799), "2000-02-29T23:59:59Z");
+	}
+
+	#[test]
+	fn now_is_an_iso_timestamp() {
+		let now = now_utc();
+		assert_eq!(now.len(), "2026-01-01T00:00:00Z".len(), "{now}");
+		assert!(now.ends_with('Z'));
+		assert_eq!(to_utc(&now).unwrap(), now);
+	}
+
+	#[test]
+	fn applies_offsets_with_minutes() {
+		assert_eq!(to_utc("2023-01-01T00:00:00+05:30").unwrap(), "2022-12-31T18:30:00Z");
+		assert_eq!(to_utc("2023-12-31T23:00:00-01:45").unwrap(), "2024-01-01T00:45:00Z");
+		assert_eq!(to_utc("2023-06-15T12:00:00.5Z").unwrap(), "2023-06-15T12:00:00Z");
+	}
+
+	#[test]
+	fn rejects_a_broken_zone_or_field() {
+		assert!(to_utc("2023-10-03T10:20:08+07").is_err());
+		assert!(to_utc("2023-10-03T10:20:08+xx:00").is_err());
+		assert!(to_utc("2023-1x-03T10:20:08Z").is_err());
+	}
+
+	#[test]
 	fn civil_date_conversions_round_trip() {
 		for days in [0, 1, 19_000, -1, -719_162, 100_000] {
 			let (y, m, d) = civil_from_days(days);

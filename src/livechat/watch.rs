@@ -29,7 +29,7 @@ const LIVECHAT_JS: &str = include_str!("js/livechat.js");
 
 /// Transcript written into the run's directory, one JSON object per line so it
 /// can be appended to and read back while the stream is still going.
-pub(super) const TRANSCRIPT_FILE: &str = "chat.jsonl";
+pub const TRANSCRIPT_FILE: &str = "chat.jsonl";
 
 /// The chat is a narrow column, so the viewport is sized to it: wide enough for
 /// the widest message, tall enough that a message stays on screen for a good
@@ -603,6 +603,60 @@ mod tests {
 		let clip = clip(&located(600.0, 52.0), "x").unwrap().expect("clip");
 		assert_eq!((clip.x, clip.y, clip.width, clip.height), (8.0, 600.0, 464.0, 52.0));
 		assert_eq!(clip.scale, 2.0);
+	}
+
+	#[test]
+	fn summarises_a_plain_message_as_author_and_text() {
+		let entry = entry(&message(), 0, None);
+		assert_eq!(summarise(&entry), "Someone: hello :wave:");
+	}
+
+	#[test]
+	fn summarises_a_paid_message_with_its_kind_and_amount() {
+		let entry = serde_json::json!({"author": "@Payer", "kind": "superchat", "amount": "$5.00", "text": "hi"});
+		assert_eq!(summarise(&entry), "@Payer [superchat $5.00]: hi");
+		let entry = serde_json::json!({"kind": "membership"});
+		assert_eq!(summarise(&entry), "(unknown) [membership]: ");
+	}
+
+	#[test]
+	fn ignores_a_send_time_that_is_not_a_number() {
+		let mut bad = message();
+		bad["timestamp_usec"] = "soon".into();
+		assert!(sent_utc(&bad).is_none());
+		bad["timestamp_usec"] = 1_700_000_000_000_000u64.into();
+		assert!(sent_utc(&bad).is_none(), "the field is a string in YouTube's data");
+	}
+
+	#[test]
+	fn keeps_custom_emoji_on_the_line_only_when_there_are_some() {
+		let mut with = message();
+		with["emojis"] = serde_json::json!([{"id": "UCa/b", "shortcut": ":b:", "url": null}]);
+		assert_eq!(entry(&with, 0, None)["emojis"][0]["shortcut"], ":b:");
+		with["emojis"] = serde_json::json!([]);
+		assert!(entry(&with, 0, None).get("emojis").is_none());
+	}
+
+	#[test]
+	fn adds_no_picture_field_unless_pictures_were_asked_for() {
+		let mut line = entry(&message(), 0, None);
+		attach_picture(&mut line, &message(), None);
+		assert!(line.get("profile_picture").is_none());
+	}
+
+	#[test]
+	fn records_a_null_picture_for_an_author_with_no_channel_id() {
+		let dir = std::env::temp_dir().join(format!("yta-watch-pic-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let pictures = ProfilePictures::new(ImageStore::new(&dir, "profile picture", false), 176);
+
+		let mut anonymous = message();
+		anonymous["author_channel_id"] = Value::Null;
+		let mut line = entry(&anonymous, 0, None);
+		attach_picture(&mut line, &anonymous, Some(&pictures));
+		assert!(line["profile_picture"].is_null());
+
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 
 	#[test]

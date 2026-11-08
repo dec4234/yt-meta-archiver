@@ -226,3 +226,27 @@ pub fn set_dark_theme_cookie(tab: &Tab) -> Result<()> {
 	eval(tab, "document.cookie = 'PREF=f6=400; domain=.youtube.com; path=/'")?;
 	Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn no_compress_flag_keeps_captures_lossless() {
+		assert_eq!(ImageFormat::from_arg(None), ImageFormat::Png);
+		assert_eq!(ImageFormat::Png.extension(), "png");
+	}
+
+	#[test]
+	fn a_bare_compress_flag_takes_the_default_quality() {
+		assert_eq!(ImageFormat::from_arg(Some(0)), ImageFormat::Webp(DEFAULT_QUALITY));
+	}
+
+	#[test]
+	fn a_compress_quality_is_kept_but_capped_at_100() {
+		assert_eq!(ImageFormat::from_arg(Some(1)), ImageFormat::Webp(1));
+		assert_eq!(ImageFormat::from_arg(Some(55)), ImageFormat::Webp(55));
+		assert_eq!(ImageFormat::from_arg(Some(250)), ImageFormat::Webp(100));
+		assert_eq!(ImageFormat::Webp(55).extension(), "webp");
+	}
+}

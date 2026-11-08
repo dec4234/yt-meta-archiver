@@ -62,7 +62,8 @@ const KINDS: [(&str, &str); 6] = [
 
 /// What a video's watch page says about its chat, and so which of the two
 /// extractors can read it.
-pub(super) enum Chat {
+#[derive(Debug)]
+pub enum Chat {
 	/// Still going: only the browser-driven live path can follow it.
 	Live,
 	/// Over, with its chat kept as a replay this module can read.
@@ -73,7 +74,8 @@ pub(super) enum Chat {
 }
 
 /// Everything needed to walk one stream's chat replay.
-pub(super) struct Replay {
+#[derive(Debug)]
+pub struct Replay {
 	/// The public InnerTube key, read off the watch page.
 	api_key: String,
 	/// The client version to claim, likewise. Sending a stale one gets the
@@ -81,6 +83,9 @@ pub(super) struct Replay {
 	client_version: String,
 	/// The token for the first chunk of chat; each response names the next.
 	continuation: String,
+	/// Where the chunks are asked for: [`REPLAY_ENDPOINT`], unless a test has
+	/// pointed it at a server of its own.
+	endpoint: String,
 }
 
 /// Asks a video's watch page how its chat can be read.
@@ -88,9 +93,15 @@ pub(super) struct Replay {
 /// Anything unexpected in the page is [`Chat::Unknown`] rather than an error:
 /// the live path is the one that has always run, and a page we cannot make sense
 /// of is no reason to stop it from trying.
-pub(super) fn probe(video_id: &str) -> Result<Chat> {
+pub fn probe(video_id: &str) -> Result<Chat> {
 	let html = http::get_html(&video::watch_url(video_id))?;
-	let data = initial_data(&html).ok_or_else(|| anyhow!("no page data on the watch page for {video_id}"))?;
+	read_watch_page(&html, video_id)
+}
+
+/// What an already fetched watch page says about its chat. `video_id` is only
+/// for the messages.
+pub fn read_watch_page(html: &str, video_id: &str) -> Result<Chat> {
+	let data = initial_data(html).ok_or_else(|| anyhow!("no page data on the watch page for {video_id}"))?;
 
 	let chat = &data["contents"]["twoColumnWatchNextResults"]["conversationBar"]["liveChatRenderer"];
 	if !chat.is_object() {
@@ -110,11 +121,11 @@ pub(super) fn probe(video_id: &str) -> Result<Chat> {
 		return Ok(Chat::Unknown);
 	};
 
-	Ok(Chat::Replay(Replay {
-		api_key: config_string(&html, "INNERTUBE_API_KEY").ok_or_else(|| anyhow!("the watch page for {video_id} carries no API key"))?,
-		client_version: config_string(&html, "INNERTUBE_CLIENT_VERSION").ok_or_else(|| anyhow!("the watch page for {video_id} carries no client version"))?,
-		continuation: continuation.to_string(),
-	}))
+	Ok(Chat::Replay(Replay::new(
+		config_string(html, "INNERTUBE_API_KEY").ok_or_else(|| anyhow!("the watch page for {video_id} carries no API key"))?,
+		config_string(html, "INNERTUBE_CLIENT_VERSION").ok_or_else(|| anyhow!("the watch page for {video_id} carries no client version"))?,
+		continuation,
+	)))
 }
 
 /// Walks the whole replay, writing the transcript as it goes. Returns how many
@@ -123,7 +134,7 @@ pub(super) fn probe(video_id: &str) -> Result<Chat> {
 /// Like the live path this appends and deduplicates rather than truncating, so a
 /// replay run over a directory that already holds a partial live capture fills
 /// in what was missed instead of throwing away what was caught.
-pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&ProfilePictures>, emojis: Option<&ImageStore>) -> Result<usize> {
+pub fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&ProfilePictures>, emojis: Option<&ImageStore>) -> Result<usize> {
 	std::fs::create_dir_all(out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
 	let path = out_dir.join(TRANSCRIPT_FILE);
 
@@ -191,9 +202,38 @@ pub(super) fn archive(replay: &Replay, out_dir: &Path, pictures: Option<&Profile
 }
 
 impl Replay {
+	/// A replay that starts at `continuation`, read from YouTube's own endpoint.
+	pub fn new(api_key: impl Into<String>, client_version: impl Into<String>, continuation: impl Into<String>) -> Self {
+		Self {
+			api_key: api_key.into(),
+			client_version: client_version.into(),
+			continuation: continuation.into(),
+			endpoint: REPLAY_ENDPOINT.to_string(),
+		}
+	}
+
+	/// The same replay, read from `endpoint` instead. This is for tests, which
+	/// answer the requests from a local server.
+	pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+		self.endpoint = endpoint.into();
+		self
+	}
+
+	pub fn api_key(&self) -> &str {
+		&self.api_key
+	}
+
+	pub fn client_version(&self) -> &str {
+		&self.client_version
+	}
+
+	pub fn continuation(&self) -> &str {
+		&self.continuation
+	}
+
 	/// One chunk of the replay.
 	fn fetch(&self, continuation: &str) -> Result<Value> {
-		let url = format!("{REPLAY_ENDPOINT}?key={}&prettyPrint=false", self.api_key);
+		let url = format!("{}?key={}&prettyPrint=false", self.endpoint, self.api_key);
 		let body = json!({
 			"context": {
 				"client": {
@@ -557,6 +597,101 @@ mod tests {
 		assert_eq!(config_string(html, "INNERTUBE_API_KEY").as_deref(), Some("AIzaSyAO_FJ2"));
 		assert_eq!(config_string(html, "INNERTUBE_CLIENT_VERSION").as_deref(), Some("2.20260729.00.00"));
 		assert_eq!(config_string(html, "NOT_THERE"), None);
+	}
+
+	fn watch_page(chat: Value, config: &str) -> String {
+		let data = json!({"contents": {"twoColumnWatchNextResults": {"conversationBar": chat}}});
+		format!("<script>{config}</script><script>var ytInitialData = {data};</script>")
+	}
+
+	const CONFIG: &str = r#"ytcfg.set({"INNERTUBE_API_KEY":"key123","INNERTUBE_CLIENT_VERSION":"2.20260729.00.00"});"#;
+
+	#[test]
+	fn a_finished_stream_is_a_replay_with_the_page_config() {
+		let html = watch_page(
+			json!({"liveChatRenderer": {"isReplay": true, "continuations": [{"reloadContinuationData": {"continuation": "op2w0"}}]}}),
+			CONFIG,
+		);
+		let Chat::Replay(replay) = read_watch_page(&html, "vid").unwrap() else {
+			panic!("want a replay");
+		};
+		assert_eq!(replay.api_key(), "key123");
+		assert_eq!(replay.client_version(), "2.20260729.00.00");
+		assert_eq!(replay.continuation(), "op2w0");
+		assert_eq!(replay.endpoint, REPLAY_ENDPOINT);
+	}
+
+	#[test]
+	fn a_running_stream_is_live() {
+		let html = watch_page(json!({"liveChatRenderer": {"continuations": [{}]}}), CONFIG);
+		assert!(matches!(read_watch_page(&html, "vid").unwrap(), Chat::Live));
+	}
+
+	#[test]
+	fn a_page_without_a_chat_or_a_continuation_is_unknown() {
+		let none = watch_page(json!({"conversationBarRenderer": {}}), CONFIG);
+		assert!(matches!(read_watch_page(&none, "vid").unwrap(), Chat::Unknown));
+		let no_token = watch_page(json!({"liveChatRenderer": {"isReplay": true, "continuations": [{}]}}), CONFIG);
+		assert!(matches!(read_watch_page(&no_token, "vid").unwrap(), Chat::Unknown));
+	}
+
+	#[test]
+	fn a_replay_without_the_page_config_is_an_error() {
+		let html = watch_page(
+			json!({"liveChatRenderer": {"isReplay": true, "continuations": [{"reloadContinuationData": {"continuation": "x"}}]}}),
+			"",
+		);
+		assert!(read_watch_page(&html, "vid").is_err());
+		assert!(read_watch_page("<html></html>", "vid").is_err());
+	}
+
+	#[test]
+	fn a_test_can_point_a_replay_at_another_endpoint() {
+		let replay = Replay::new("k", "v", "c").with_endpoint("http://127.0.0.1:1/x");
+		assert_eq!(replay.endpoint, "http://127.0.0.1:1/x");
+		assert_eq!(replay.continuation(), "c");
+	}
+
+	#[test]
+	fn reads_the_ids_already_in_a_transcript() {
+		let dir = std::env::temp_dir().join(format!("yta-replay-ids-test-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		let path = dir.join(TRANSCRIPT_FILE);
+		assert!(existing_ids(&path).unwrap().is_empty(), "a missing file has no ids");
+
+		std::fs::write(&path, "{\"id\":\"a\"}\nnot json\n{\"no_id\":1}\n{\"id\":\"b\"}\n").unwrap();
+		let ids = existing_ids(&path).unwrap();
+		assert_eq!(ids, HashSet::from(["a".to_string(), "b".to_string()]));
+
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn blank_text_is_no_text() {
+		let mut emojis = Vec::new();
+		assert_eq!(simple_text(&json!({"simpleText": "  "})), None);
+		assert_eq!(simple_text(&json!({"simpleText": " a "})).as_deref(), Some("a"));
+		assert_eq!(runs_text(&json!({"runs": [{"text": "  "}]}), &mut emojis), None);
+		assert_eq!(runs_text(&json!({}), &mut emojis), None);
+		// A run that is neither text nor emoji adds nothing.
+		assert_eq!(runs_text(&json!({"runs": [{"text": "a"}, {"other": 1}, {"text": "b"}]}), &mut emojis).as_deref(), Some("ab"));
+	}
+
+	#[test]
+	fn a_badge_with_no_name_is_skipped() {
+		let renderer = json!({"authorBadges": [
+			{"liveChatAuthorBadgeRenderer": {"tooltip": "Moderator"}},
+			{"liveChatAuthorBadgeRenderer": {"icon": {}}},
+		]});
+		assert_eq!(badges(&renderer), vec!["Moderator".to_string()]);
+		assert!(badges(&json!({})).is_empty());
+	}
+
+	#[test]
+	fn a_message_with_no_offset_is_at_the_start() {
+		let chat = json!({"actions": [{"replayChatItemAction": {"actions": [{"addChatItemAction": {"item": text_message()}}]}}]});
+		assert_eq!(messages(&chat)[0].1, 0);
+		assert!(messages(&json!({})).is_empty());
 	}
 
 	#[test]

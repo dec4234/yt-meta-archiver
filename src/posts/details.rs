@@ -13,7 +13,7 @@ use crate::{http, time};
 
 /// What a post's page tells us about it. Every field is optional: a lookup
 /// that came back empty is still worth telling apart from one never made.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Details {
 	/// When it went up, as an ISO 8601 UTC timestamp.
 	pub published_utc: Option<String>,
@@ -25,8 +25,13 @@ pub struct Details {
 /// only when the page cannot be fetched or carries no such block; a field the
 /// block happens to omit comes back as `None`.
 pub fn fetch(post_id: &str) -> Result<Details> {
-	let html = http::get_html(&super::post_url(post_id))?;
-	let posting = extract_posting(&html).ok_or_else(|| anyhow!("post page carried no JSON-LD block"))?;
+	from_html(&http::get_html(&super::post_url(post_id))?)
+}
+
+/// The details an already fetched post page carries, with the same errors as
+/// [`fetch`].
+pub fn from_html(html: &str) -> Result<Details> {
+	let posting = extract_posting(html).ok_or_else(|| anyhow!("post page carried no JSON-LD block"))?;
 
 	let published_utc = match posting["datePublished"].as_str() {
 		Some(raw) => Some(time::to_utc(raw)?),
@@ -59,6 +64,26 @@ mod tests {
 		let posting = extract_posting(html).unwrap();
 		assert_eq!(posting["datePublished"], "2023-10-03T10:20:08.354091-07:00");
 		assert_eq!(posting["text"], "line one\nline two \"quoted\"");
+	}
+
+	#[test]
+	fn reads_the_date_in_utc_and_the_text() {
+		let html = r#"<script type="application/ld+json">{"datePublished":"2023-10-03T10:20:08.354091-07:00","text":"hi"}</script>"#;
+		let details = from_html(html).unwrap();
+		assert_eq!(details.published_utc.as_deref(), Some("2023-10-03T17:20:08Z"));
+		assert_eq!(details.text.as_deref(), Some("hi"));
+	}
+
+	#[test]
+	fn an_attachment_only_post_has_no_text() {
+		let html = r#"<script type="application/ld+json">{"text":""}</script>"#;
+		assert_eq!(from_html(html).unwrap(), Details::default());
+	}
+
+	#[test]
+	fn a_page_without_the_block_or_with_a_bad_date_is_an_error() {
+		assert!(from_html("<html></html>").is_err());
+		assert!(from_html(r#"<script type="application/ld+json">{"datePublished":"last week"}</script>"#).is_err());
 	}
 
 	#[test]
